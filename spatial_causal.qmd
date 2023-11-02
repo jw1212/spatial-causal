@@ -11,7 +11,7 @@ editor: visual
 ---
 
 ```{r, include=FALSE}
-setwd("/Users/jiaxi/research/spatial")
+setwd("/Users/jiaxi/research/spatial-causal")
 ```
 
 ```{r, message = FALSE}
@@ -163,6 +163,7 @@ The idea about variables at different scale works for general hierarchical model
 In the simulation, we generate data with $\beta_T = \beta_U =1, \sigma^2=\sigma_T^2=\sigma_Y^2=0.2$, so $\eta_{T\sim U\mid X,S}^2 =0.5, \tilde{\sigma}_T^2 = 0.4, \tilde{\sigma}_Y^2 = 0.3$. $f(S)$, $Z$ and $W$ are generated from GP. (If able to use sufficient statistics like average in location and variance can make computation easier.)
 
 Follow the Bayesian workflow suggested in [Birthdays notebook](https://avehtari.github.io/casestudies/Birthdays/birthdays.html#Workflow_for_quick_iterative_model_building), we first use optimization and mcmc with small number of iterations for quick testing of the model. We check if $\tilde{\beta}_T$, $\tilde{\sigma}_T^2$, $\tilde{\sigma}_Y^2$ and $\sigma_Y^2$ can be consistently estimated by fitting models $T_i\mid S_i \overset{\mathrm{iid}}{\sim} N(\tilde{f}(S_i), \tilde{\sigma}_T^2)$ and $Y\mid T,S \sim N(\tilde{\beta}_TT + \tilde{h}(S),\Sigma)$ as above.
+:::
 
 ```{r mcmc, message=FALSE}
 # set.seed(111)
@@ -173,7 +174,7 @@ u <- gp_sample(s, a2 = 1, l = 1, sigma2 = 0.2)
 z <- gp_sample(s, a2 = 1, l = 2, sigma2 = 0.2)
 t <- u + z # + rnorm(n, mean = 0, sd = sqrt(0.2))
 data_list_t <- list(D=ncol(s), N=m, s=s[1:m,], t=t[1:m,])
-trt_model <- cmdstan_model(stan_file = "treatment_gp.stan")
+trt_model <- cmdstan_model(stan_file = "stan/treatment_gp.stan")
 trt_opt <- trt_model$optimize(data=data_list_t, init=2, refresh=1000, iter=10000)
 opt_draws <- trt_opt$draws()
 cat("MAP of sigma_t_tilde_sq =", as.numeric(subset(opt_draws, variable=c('sigma_t')))^2)
@@ -211,7 +212,7 @@ y <- t + u + w + rnorm(n, mean = 0, sd = sqrt(0.2)) # + w
 
 # MAP estimate of sigma_y_tilde and sigma_y
 data_list <- list(D=ncol(s), M=m, N=length(y), s=s, t=t, y=y)
-outcome_model_1 <- cmdstan_model(stan_file = "replication_t_u.stan")
+outcome_model_1 <- cmdstan_model(stan_file = "stan/replication_t_u.stan")
 outcome_opt_1 <- outcome_model_1$optimize(data=data_list, init=2, refresh=500, iter=10000)
 opt_draws <- outcome_opt_1$draws()
 print(subset(opt_draws, variable=c('beta', 'sq_sigma_y', 'sq_sigma_y_tilde')))
