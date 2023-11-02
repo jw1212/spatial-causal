@@ -1,0 +1,364 @@
+---
+title: "Spatial Causal Inference"
+author: Jiaxi Wu
+format:
+  html:
+    # embed-resources: true
+    self-contained: true
+    code-fold: true
+    code-summary: "Show the code"
+editor: visual
+---
+
+```{r, include=FALSE}
+setwd("/Users/jiaxi/research/spatial")
+```
+
+```{r, message = FALSE}
+library(cmdstanr)
+library(tidyverse)
+library(INLA)
+library(fmesher)
+# library(rstan)
+# rstan_options(auto_write = TRUE)
+options(mc.cores=parallel::detectCores())
+```
+
+```{r functions, message = FALSE}
+gp_sample <- function(x, a2 = 1, l = 1, sigma2 = 0.1){
+  n <- nrow(x)
+  mu <- rep(0, n)
+  K <- matrix(nrow = n, ncol = n)
+  for (i in 1:(n - 1)) {
+    K[i, i] = a2 + sigma2
+    for (j in (i + 1):n) {
+      K[i, j] = a2 * exp(-sum((x[i,] - x[j,])^2) / l)
+      K[j, i] = K[i, j]
+    }
+  }
+  K[n, n] = a2 + sigma2
+  return(t(mvtnorm::rmvnorm(1, sigma = K))) 
+}
+```
+
+## Spatial causal inference setting
+
+Let $T$ denote the treatment, $Y$ denote the outcome, $S$ denote the spatial coordinates, $U$ denote the unobserved spatial confounder, and $X$ denote the observed covariates. $S$ could possibly affect all the other variables and usually $U$ is not a fixed, measurable function of $S$, so the causal effect cannot be identified without additional assumptions if we adjust for $X$ and $S$ only [(Gilbert et al. 2021)](https://arxiv.org/pdf/2112.14946.pdf). In general, we assume exchangeability given $S,X,U$ (Assumption 3.4 in Gilbert et al. 2021) and positivity. We are interested in the average treatment effect $E[Y(t)]$ and $E[Y(t) \mid X,S]$.
+
+### General omitted variable bias
+
+We first consider the outcome model which is linear in $T$ [(Chernozhukov et al., 2022)](https://www.nber.org/system/files/working_papers/w30302/w30302.pdf): $Y = \beta T + f(X,S,U) + \epsilon$. Since $U$ is unobserved, the "short" regression with observed variables is $Y = \tilde{\beta}T + \tilde{f}(X,S) + \tilde{\epsilon}$. Let $\alpha=\frac{T-E[T|X,S,U]}{E(T-E[T|X,S,U])^2}$, $\tilde{\alpha} =\frac{T-E[T|X,S]}{E(T-E[T|X,S])^2}$, $g=E[Y|T,X,S,U]$, $\tilde{g}=E[Y|T,X,S]$, then $\beta=E[Y\alpha]=E[g\alpha]$, $\tilde{\beta}=E[Y\tilde{\alpha}] =E[\tilde{g}\tilde{\alpha}]$. The omitted variable bias is $\beta - \tilde{\beta} = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]$ and it is bounded by
+
+```{=tex}
+\begin{equation}
+    |\tilde{\beta} - \beta|^2 =\rho^2B^2\leq B^2,
+\end{equation}
+```
+where $\rho^2 = Cor^2(g-\tilde{g}, \alpha-\tilde{\alpha})$, $B^2=E(g - \tilde{g})^2E(\alpha - \tilde{\alpha})^2$. $B^2$ can be further expressed as
+
+```{=tex}
+\begin{equation}
+    B^2= S^2C_Y^2C_T^2,
+\end{equation}
+```
+where $S^2 = E(Y-\tilde{g})^2E\tilde{\alpha}^2$ is identifiable, $C_Y^2 = R^2_{Y-\tilde{g}\sim g-\tilde{g}} = \eta_{Y\sim U\mid T,X,S}^2$, $C_T^2 = \frac{1-R^2_{\alpha \sim \tilde{\alpha}}}{R^2_{\alpha \sim \tilde{\alpha}}} = \frac{\eta_{T\sim U \mid X,S}^2}{1-\eta_{T\sim U\mid X,S}^2}$. There are three unidentified parameters $\rho^2$, $\eta_{T\sim U \mid X,S}^2$ and $\eta_{Y\sim U|T,X,S}^2$, which can be benchmarked empirically from observed data.
+
+This result can be extended to more general nonparametric causal models.
+
+### Partially linear data generating process
+
+Spatial modeling usually considers a partially linear model with spatial patterns modeled by Gaussian processes, splines or CAR processes:
+
+```{=tex}
+\begin{align} 
+    T &= \alpha_XX + \alpha_UU + Z + \delta, \\
+    Y &= \beta_TT + \beta_XX + \beta_UU + W + \epsilon, 
+\end{align}
+```
+where $Z$ and $W$ are spatial variables, but $U$ is not a fixed measurable function of $S,X$ so it is insufficient to adjust for $S,X$ only. We also assume $U = f(S) + V$, $V \sim N(0,\sigma^2)$, $\delta \sim N(0,\sigma_T^2)$, $\epsilon \sim N(0,\sigma_Y^2)$. Then
+
+```{=tex}
+\begin{align}
+    T \mid S,X &\sim N(\alpha_XX + \alpha_Uf(S) + Z, \tilde{\sigma}_T^2 = \alpha_U^2\sigma^2 + \sigma_T^2), \\ 
+    U \mid T,S,X &\sim N(f(S) + w(T - \alpha_XX - \alpha_Uf(S) - Z), \sigma^2 - \alpha_Uw\sigma^2), \\
+    E[Y \mid T,   S,X] &= \beta_TT + \beta_XX  + \beta_UwT + \beta_U(1-\alpha_Uw)f(S) - \beta_Uw\alpha_XX - \beta_UwZ + W, \\
+    &= \tilde{\beta}_TT + \tilde{\beta}_XX - \beta_UwZ + W + \tilde{\beta}_U\tilde{f}(S). \\
+    Var(Y\mid T,S,X) &=  \beta_U^2\sigma^2(1-\alpha_Uw) + \sigma_Y^2.
+\end{align}
+```
+In general, $f(S)$, $Z$ and $W$ are not separable. We characterize the omitted confounder bias by comparing to the short regresssion $T = \tilde{\alpha}_XX + \tilde{f}(S) + \tilde{\delta}$ and $Y = \tilde{\beta}_TT + \tilde{\beta}_XX + \tilde{h}(S) + \tilde{\epsilon}$. In this case $\beta_T - \tilde{\beta}_T = E[(g - \tilde{g})(\alpha - \tilde{\alpha})] = -\beta_Uw$. On the other hand, $E(\alpha - \tilde{\alpha})^2 = \frac{1}{\sigma_T^2} - \frac{1}{\alpha_U^2\sigma^2 + \sigma_T^2}$, $E(g - \tilde{g})^2 = \beta_U^2E((1-\alpha_Uw)V-w\epsilon)^2 = \beta_U^2\frac{\sigma^2\sigma_T^2}{\alpha_U^2\sigma^2 + \sigma_T^2}$. Hence we have
+
+```{=tex}
+\begin{equation}
+    |\tilde{\beta}_T - \beta_T|^2 = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]^2 = E(g - \tilde{g})^2E(\alpha - \tilde{\alpha})^2 = E(Y-\tilde{g})^2E\tilde{\alpha}^2 \eta_{Y\sim U|T,X,S}^2 \frac{\eta_{T\sim U|X,S}^2}{1-\eta_{T\sim U|X,S}^2}.
+\end{equation}
+```
+This is because $g-\tilde{g} = \beta_U((1-\alpha_Uw)V-w\epsilon) = -\frac{\beta_U\sigma_T^2}{\alpha_U}(\alpha - \tilde{\alpha})$ and $\alpha - \tilde{\alpha}$ are colinear. The bias can be characterized by $\eta_{Y\sim U|T,X,S}^2$ and $\eta_{T\sim U|X,S}^2$ without $\rho^2$. The partially linear model $Y_i=\beta T_i +g(S_i)+\epsilon_i$ can be identified under some smoothness assumptions ([Gilbert et al. 2023](https://arxiv.org/pdf/2308.12181.pdf)).
+
+### Spatial location only affects the unmeasured confounder
+
+Suppose spatial location only affects potential outcomes and exposure through the unmeasured confounders (Gilbert et al. 2021 Assumptions 3.1 + 3.2 + 3.5, but no 3.3, which leads to non-identification):
+
+```{=tex}
+\begin{align} 
+    U &= f(S) + V, V\sim N(0,\sigma^2),  \\
+    T &= \alpha_XX + \alpha_UU + \delta, \\
+    Y &= \beta_TT + \beta_XX + \beta_UU + \epsilon.
+\end{align}
+```
+If we fit $T \sim \alpha_XX + \tilde{f}(S) + \tilde{\delta}$ and $Y \sim \tilde{\beta}_TT + \tilde{\beta}_XX + \tilde{\beta}_U\tilde{f}(S) + \tilde{\epsilon}$ on observed data for this partially linear DGP, then the confounding bias can be characterized by a single sensitivity parameter $\eta^2_{T\sim U \mid X,S}$:
+
+```{=tex}
+\begin{equation}
+\tilde{\beta}_T - \beta_T = \beta_Uw = \tilde{\beta}_U\frac{\eta^2_{T\sim U \mid X,S}}{1 - \eta^2_{T\sim U \mid X,S}}.
+\end{equation}
+```
+This result can be generalized to models that are nonlinear in $T$ and $X$. Simulation result is in overleaf.
+
+### Replications at each $S$ and variables at different resolutions
+
+If at each $S$, $U$ is invariant, but $T$, $Y$, $X$ are not, then case-control matching methods regress the difference between responses in the same region to remove spatial confounding. If $T_i$ (or $Y$) is invariant at location $i$ (treatment at the same scale as unmeasured confounders), the causal effect is not directly identified, but we may use $Y_{ij}-Y_{ik}$ or the outcome model to estimate $\sigma_Y^2$. Then $\eta_{Y\sim U|T,X,S}^2 = \frac{E(g - \tilde{g})^2}{E(Y - \tilde{g})^2} = \frac{E(g - \tilde{g})^2}{E(g - \tilde{g})^2 + \sigma_Y^2}$ is identified from $E(Y - \tilde{g})^2$ and $\sigma_Y^2$. For example, consider the PM2.5 in a region $S_i$ as the treatment, instead of $1$ kilometer resolution. This idea also works for areal data [(Reich et al., 2020)](https://arxiv.org/pdf/2007.02714.pdf). May related to clustered randomized trial, repeated measurements and mixed effect models.
+
+Although we assume positivity for $T$ in the DGP, if we consider $S$ as a covariate and only observe a single $T_i$ for each $S_i$ (treatment does not vary at a smaller scale than the spatial confounder), a potential concern is that it leads to a practical (not structural) violation of positivity/overlap, which is unavoidable when the treatment is continuous and covariate space is high-dimensional [(Zhu et al., 2021)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8492528/). In this case there is no data for us to learn about the counterfactuals at each location and we have to make some smoothness assumptions. The causal conclusions we make rely more on the model extrapolation and less on data itself (Section 3.2 in [Gilbert et al. 2021](https://arxiv.org/pdf/2112.14946.pdf) and [Gelman book, 2006](http://www.stat.columbia.edu/~gelman/arm/chap10.pdf)).
+
+We omit covariates $X_{ij}$ for brevity or imagine they are absorbed by the functions of $S_i$. Consider the following data generating process with replications of observations at each location:
+
+```{=tex}
+\begin{align}
+    U_i &= f(S_i) + V_i, \\
+    T_i &= \alpha_UU_i + Z_i + \delta_i, \\
+    Y_{ij} &= \beta_TT_i + \beta_UU_i + W_i + \epsilon_{ij}, 
+\end{align} 
+```
+where $Y_{ij}$ denotes the $j$th observation at location $i$, $Z_i=f_Z(S_i)$ and $W_i=f_W(S_i)$ are fixed, measurable functions of $S_i$, $V_i \sim N(0,\sigma^2)$, $\delta_i \sim N(0,\sigma_T^2)$, $\epsilon_i \sim N(0,\sigma_Y^2)$ are independent of each other and $S_i$. The estimand is $E[Y_{ij}(t+1)] - E[Y_{ij}(t)] = E[Y_i(t+1)\mid S_i=s] - E[Y_i(t)\mid S_i=s] = \beta_T$. Then
+
+```{=tex}
+\begin{align}
+    T_i \mid S_i &\sim N(\alpha_U f(S_i) + Z_i, \tilde{\sigma}_T^2 = \alpha_U^2\sigma^2 + \sigma_T^2), \\ 
+    U_i \mid T_i,S_i &\sim N(f(S_i) + w(T_i - \alpha_Uf(S_i) - Z_i), \sigma^2(1 - \alpha_Uw)), \\
+    Y_{ij} \mid T_i,S_i &\sim N(\beta_TT_i  + \beta_UwT_i + \beta_U(1-\alpha_Uw)f(S_i) - \beta_UwZ_i + W_i, \beta_U^2\sigma^2(1 - \alpha_Uw) + \sigma_Y^2) \\
+    &\sim N(\tilde{\beta}_TT_i + \tilde{\beta}_U\tilde{f}(S_i) - \beta_UwZ_i + W_i, \tilde{\sigma}_Y^2),
+\end{align} 
+```
+where $w=\frac{\alpha_U\sigma^2}{\alpha_U^2\sigma^2 + \sigma_T^2}$. We also need to account for the intraclass correlation $Cov(Y_{ij},Y_{ik}\mid T, S) = \beta_U^2Var(U_i\mid T_i,S_i) = \tilde{\sigma}_Y^2 - \sigma_Y^2$. Let $Y$ denote the vector of all the outcomes.
+
+::: {.callout-note icon="false"}
+#### Bias of $\tilde{\beta}_T$
+
+Fit models on observed data $T_i\mid S_i \overset{\mathrm{iid}}{\sim} N(\tilde{f}(S_i), \tilde{\sigma}_T^2)$ and $Y\mid T,S \sim N(\tilde{\beta}_TT + \tilde{h}(S),\Sigma)$ with GP priors on $\tilde{f}$ and $\tilde{h}$, $\Sigma$ following the above block diagonal structure. Then $\tilde{\sigma}_T^2$, $\tilde{\sigma}_Y^2$ and $\sigma_Y^2$ are identifiable and the bias is:
+
+$$
+|\tilde{\beta}_T - \beta_T|^2 = E(Y-\tilde{g})^2E\tilde{\alpha}^2 \eta_{Y\sim U|T,X,S}^2 \frac{\eta_{T\sim U|X,S}^2}{1-\eta_{T\sim U|X,S}^2} = \frac{\tilde{\sigma}_Y^2 - \sigma_Y^2}{\tilde{\sigma}_T^2}\frac{\eta_{T\sim U \mid X,S}^2}{1-\eta_{T\sim U\mid X,S}^2}
+$$
+:::
+
+Note that $\tilde{h}(S)$ are repeated measurements, so the GP prior should be assigned to non-repeated locations.
+
+Another way of recovering $\sigma^2_Y$ is to fit a mixed effect model $Y_{ij} = \tilde{\beta}_TT_i + \tilde{h}(S_i) + \tilde{V}_i + \epsilon_{ij}$. 
+
+The idea about variables at different scale works for general hierarchical models [(Witty et al. 2020)](https://proceedings.mlr.press/v119/witty20a/witty20a.pdf). But this paper modeled entire treatment, outcome with GP. 
+
+#### Simulation
+
+In the simulation, we generate data with $\beta_T = \beta_U =1, \sigma^2=\sigma_T^2=\sigma_Y^2=0.2$, so $\eta_{T\sim U\mid X,S}^2 =0.5, \tilde{\sigma}_T^2 = 0.4, \tilde{\sigma}_Y^2 = 0.3$. $f(S)$, $Z$ and $W$ are generated from GP. (If able to use sufficient statistics like average in location and variance can make computation easier.)
+
+Follow the Bayesian workflow suggested in [Birthdays notebook](https://avehtari.github.io/casestudies/Birthdays/birthdays.html#Workflow_for_quick_iterative_model_building), we first use optimization and mcmc with small number of iterations for quick testing of the model. We check if $\tilde{\beta}_T$, $\tilde{\sigma}_T^2$, $\tilde{\sigma}_Y^2$ and $\sigma_Y^2$ can be consistently estimated by fitting models $T_i\mid S_i \overset{\mathrm{iid}}{\sim} N(\tilde{f}(S_i), \tilde{\sigma}_T^2)$ and $Y\mid T,S \sim N(\tilde{\beta}_TT + \tilde{h}(S),\Sigma)$ as above.
+
+```{r mcmc, message=FALSE}
+# set.seed(111)
+# estimate sigma_t_tilde
+m <- 1000 # number of locations
+s <- matrix(runif(2*m, -1, 1), ncol = 2)
+u <- gp_sample(s, a2 = 1, l = 1, sigma2 = 0.2)
+z <- gp_sample(s, a2 = 1, l = 2, sigma2 = 0.2)
+t <- u + z # + rnorm(n, mean = 0, sd = sqrt(0.2))
+data_list_t <- list(D=ncol(s), N=m, s=s[1:m,], t=t[1:m,])
+trt_model <- cmdstan_model(stan_file = "treatment_gp.stan")
+trt_opt <- trt_model$optimize(data=data_list_t, init=2, refresh=1000, iter=10000)
+opt_draws <- trt_opt$draws()
+cat("MAP of sigma_t_tilde_sq =", as.numeric(subset(opt_draws, variable=c('sigma_t')))^2)
+
+set.seed(123)
+m <- 100 # number of locations
+n <- 300
+s <- matrix(runif(2*m, -1, 1), ncol = 2) # rep(s[,1], times=a)
+u <- gp_sample(s, a2 = 1, l = 1, sigma2 = 0.2) 
+z <- gp_sample(s, a2 = 1, l = 2, sigma2 = 0.2)
+w <- gp_sample(s, a2 = 1, l = 3, sigma2 = 0)
+t <- u + z # + rnorm(m, mean = 0, sd = sqrt(0.2))  
+# s <- s[rep(1:nrow(s), each=n/m),] 
+u <- u[rep(1:nrow(u), each=n/m),] 
+t <- t[rep(1:nrow(t), each=n/m),] 
+w <- w[rep(1:nrow(w), each=n/m),] 
+# s <- do.call(rbind, replicate(5, s, simplify=FALSE))
+# u <- do.call(rbind, replicate(5, u, simplify=FALSE))
+# t <- do.call(rbind, replicate(5, t, simplify=FALSE))
+y <- t + u + w + rnorm(n, mean = 0, sd = sqrt(0.2)) # + w
+
+# plot
+# u_density <- tibble(f = u, s1 = s[,1], s2 = s[,2])
+# u_density %>%
+#   ggplot(aes(x=s1, y=s2, color=f)) +
+#   geom_point(alpha=1, size=2.5) +
+#   theme_bw()
+
+# # estimate sigma_y_tilde
+# data_list_y <- list(D=ncol(s), N=length(y), s=s[rep(1:nrow(s), each=n/m),] , t=t, y=y)
+# outcome_model <- cmdstan_model(stan_file = "outcome_gp.stan")
+# outcome_opt <- outcome_model$optimize(data=data_list_y, init=2, refresh=100, iter=10000)
+# opt_draws <- outcome_opt$draws()
+# print(subset(opt_draws, variable=c('beta', 'sq_sigma_y')))
+
+# MAP estimate of sigma_y_tilde and sigma_y
+data_list <- list(D=ncol(s), M=m, N=length(y), s=s, t=t, y=y)
+outcome_model_1 <- cmdstan_model(stan_file = "replication_t_u.stan")
+outcome_opt_1 <- outcome_model_1$optimize(data=data_list, init=2, refresh=500, iter=10000)
+opt_draws <- outcome_opt_1$draws()
+print(subset(opt_draws, variable=c('beta', 'sq_sigma_y', 'sq_sigma_y_tilde')))
+
+# mcmc 
+run_sampler <- 0
+if(run_sampler) {
+  stan_results <- outcome_model_1$sample(data_list, iter_warmup = 1000, 
+                                         iter_sampling = 1000, refresh = 500) 
+  stan_results$save_object(file="simulation_rep_n300.RDS")
+} else {
+  stan_results <- readRDS("simulation_rep_n300.RDS")
+}
+result <- stan_results$summary(variables = c('beta', 'sq_sigma_y', 'sq_sigma_y_tilde'))
+print(result)
+```
+
+The posterior estimates are close to true values of $\tilde{\sigma}_T^2$, $\tilde{\beta}_T$, $\tilde{\sigma}_Y^2$ and $\sigma_Y^2$, and the $90\%$ credible intervals cover them.
+
+Next we try faster approximate Bayesian inference using [R-INLA](https://www.r-inla.org/home). The continuous domain spatial modeling is done by stochastic partial differential equation (SPDE) approach. We first build a treatment model.
+
+```{r INLA}
+set.seed(123)
+n <- 500 # number of locations
+s <- matrix(runif(2*n, -1, 1), ncol = 2)
+u <- gp_sample(s, a2 = 1, l = 1, sigma2 = 0.2)
+z <- gp_sample(s, a2 = 1, l = 2, sigma2 = 0.2)
+t <- u + z # + rnorm(n, mean = 0, sd = sqrt(0.2))
+# data1 <- data.frame(s1 = s[,1], s2 = s[,2], t = t)
+# plot
+tibble(f = t, s1 = s[,1], s2 = s[,2]) %>%
+  ggplot(aes(x=s1, y=s2, color=f)) +
+  geom_point(alpha=1, size=2.5) +
+  theme_bw()
+
+# use fmesher to create meshes, tradeoff between accuracy and computational cost
+mesh1 <- fm_mesh_2d_inla(loc=s, max.edge=c(0.05, 0.15), cutoff=0.02, offset=c(0.1,0.4))
+plot(mesh1)
+points(s, pch=3, bg=1, col="red", cex=1)
+
+# create projector matrix A, mapping triangulation vertices on mesh to observation locations
+A.est <- inla.spde.make.A(mesh=mesh1, loc=s)
+print(dim(A.est)) # number of data locations * number of mesh nodes
+
+# fit model
+spde <- inla.spde2.matern(mesh=mesh1, alpha=2) 
+formula <- y ~ -1 + intercept + f(spatial.field, model=spde)
+# spatial.field is a index variable?
+result <- inla(formula, 
+               data = list(y=t[,1], intercept=rep(1, spde$n.spde),
+               spatial.field=1:spde$n.spde),
+               control.predictor=list(A=A.est, compute=TRUE))
+
+# round(result$summary.fixed, 3)
+print(round(result$summary.hyperpar, 3))
+cat("posterior mean of sigma_t_tilde_sq =", inla.emarginal(function(x) 1/x, result$marginals.hyper[[1]])) # posterior mean of variance
+```
+
+Posterior mean is close to $0.4$ and $95\%$ credible interval covers true $\tilde{\sigma}_T^2$.
+
+Then we check the posterior distributions of $\tilde{\beta}_T$, $\tilde{\sigma}_Y^2$ and $\sigma_Y^2$ by fitting $Y_{ij} = \beta_0 + \tilde{\beta}_TT_i + \tilde{h}(S_i) + \tilde{V}_i + \epsilon_{ij}$ without marginalizing out $U_i$. The random effect $\tilde{V}_i$ accounts for the between-group variation $\beta_U^2Var(U_i \mid T_i,S_i)= \tilde{\sigma}_Y^2 -\sigma_Y^2 =0.1$.
+
+```{r replication}
+# with replicates at each location
+set.seed(111)
+m <- 100 # number of locations
+n <- 500
+s <- matrix(runif(2*m, -1, 1), ncol = 2) # rep(s[,1], times=a)
+group <- rep(1:m, each=n/m)
+u <- gp_sample(s, a2 = 1, l = 1, sigma2 = 0.2) 
+z <- gp_sample(s, a2 = 1, l = 2, sigma2 = 0.2)
+w <- gp_sample(s, a2 = 1, l = 3, sigma2 = 0)
+t <- u + z # + rnorm(m, mean = 0, sd = sqrt(0.2))  
+u <- u[rep(1:nrow(u), each=n/m),] 
+t <- t[rep(1:nrow(t), each=n/m),] 
+w <- w[rep(1:nrow(w), each=n/m),] 
+y <- t + u + w + rnorm(n, mean = 0, sd = sqrt(0.2)) 
+
+mesh <- fm_mesh_2d_inla(loc=s, max.edge=c(0.05, 0.2), offset=c(0.1,0.4))
+
+# For each observation, index gives the corresponding index into the matrix of measurement locations, and repl determines the corresponding replicate index. 
+A <- inla.spde.make.A(mesh, loc = s, index = rep(1:m, each = n/m), 
+                      repl = rep(1:(n/m), times = m))
+print(dim(A))
+spde <- inla.spde2.matern(mesh=mesh, alpha=2) 
+
+# index the full mesh and replicates
+mesh.index <- inla.spde.make.index(name = "field", n.spde = spde$n.spde,
+                                   n.repl = n/m)
+
+# stack the predictor information
+stack <- inla.stack(data = list(y = y), A = list(A, 1),
+                    effects = list(c(mesh.index, list(intercept = 1)),
+                                   list(cov = t, loc = group)), tag = "est")
+
+# fit model
+formula <- y ~ -1 + intercept + cov + f(field, model = spde, replicate = field.repl) + f(loc, model = "iid")
+rep_result <- inla(formula, data = inla.stack.data(stack, spde = spde),
+                   family = "normal",
+                   control.predictor = list(A = inla.stack.A(stack),
+                                             compute = TRUE))
+print(round(rep_result$summary.fixed, 3))
+print(round(rep_result$summary.hyperpar, 3))
+cat("posterior mean of sigma_y_tilde_sq - sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[4]]), '\n')
+cat("posterior mean of sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[1]])) 
+
+posterior_beta_tilde <- rep_result$marginals.fixed[[2]]
+plot(posterior_beta_tilde, type = "l", xlab = 'beta_t_tilde', ylab = 'density',
+     main = "Posterior density of beta_t_tilde")
+
+posterior_sigma_y_sq <- rep_result$marginals.hyperpar[[1]]
+posterior_sigma_y_sq[,1] <- 1 / posterior_sigma_y_sq[,1]
+plot(posterior_sigma_y_sq, type = "l", xlab = 'sigma_y_sq', ylab = 'density',
+     main = "Posterior density of sigma_y_sq")
+
+posterior_sigma_y_tilde_sq <- rep_result$marginals.hyperpar[[4]]
+posterior_sigma_y_tilde_sq[,1] <- 1 / posterior_sigma_y_tilde_sq[,1] +
+  posterior_sigma_y_sq[,1]
+plot(posterior_sigma_y_tilde_sq, type = "l", xlab = 'sigma_y_tilde_sq', ylab = 'density',
+     main = "Posterior density of sigma_y_tilde_sq")
+```
+
+The $95\%$ credible intervals cover true $\tilde{\beta}_T, \tilde{\sigma}_Y^2-\sigma_Y^2, \sigma_Y^2$.
+
+### When treatment effect is identified
+
+$U$ is a fixed, measurable function of $S$. Or $U$ is fixed at each location, but $T$ and $Y$ are not.
+
+### Binary treatment
+
+$T_{ij} \sim Bernoulli(e_{ij})$, where $e_{ij}$
+
+### Areal data
+
+Replace the $f$ in $U_i=f(S_i)+V_i$ by a CAR process. Identifiability of CAR processes? Perform sensitivity analysis based on residual variances.
+
+### Application
+
+PM2.5 on birthweight [(Gilbert et al. 2021)](https://arxiv.org/pdf/2112.14946.pdf), consider treatment and spatial location at the same resolution.
+
+
+[(Witty et al. 2020)](https://proceedings.mlr.press/v119/witty20a/witty20a.pdf) duplicate data instances with real treatments, covariates, confounders and a synthetic outcome function to make a synthetic dataset. Or preserves outcome functions from real quasi-experimental data, and uses biased sampling to induce confounding.
+
+
+# more general model
+
+nonlinear in T,X? interaction? 
+
+
+
