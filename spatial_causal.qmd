@@ -154,9 +154,9 @@ $$
 
 Note that $\tilde{h}(S)$ are repeated measurements, so the GP prior should be assigned to non-repeated locations.
 
-Another way of recovering $\sigma^2_Y$ is to fit a mixed effect model $Y_{ij} = \tilde{\beta}_TT_i + \tilde{h}(S_i) + \tilde{V}_i + \epsilon_{ij}$. 
+Another way of recovering $\sigma^2_Y$ is to fit a mixed effect model $Y_{ij} = \tilde{\beta}_TT_i + \tilde{h}(S_i) + \tilde{V}_i + \epsilon_{ij}$.
 
-The idea about variables at different scale works for general hierarchical models [(Witty et al. 2020)](https://proceedings.mlr.press/v119/witty20a/witty20a.pdf). But this paper modeled entire treatment, outcome with GP. 
+The idea about variables at different scale works for general hierarchical models [(Witty et al. 2020)](https://proceedings.mlr.press/v119/witty20a/witty20a.pdf). But this paper modeled entire treatment, outcome with GP.
 
 #### Simulation
 
@@ -352,13 +352,8 @@ Replace the $f$ in $U_i=f(S_i)+V_i$ by a CAR process. Identifiability of CAR pro
 
 PM2.5 on birthweight [(Gilbert et al. 2021)](https://arxiv.org/pdf/2112.14946.pdf), consider treatment and spatial location at the same resolution.
 
-
 [(Witty et al. 2020)](https://proceedings.mlr.press/v119/witty20a/witty20a.pdf) duplicate data instances with real treatments, covariates, confounders and a synthetic outcome function to make a synthetic dataset. Or preserves outcome functions from real quasi-experimental data, and uses biased sampling to induce confounding.
-
 
 # more general model
 
-nonlinear in T,X? interaction? 
-
-
-
+nonlinear in T,X? interaction?
