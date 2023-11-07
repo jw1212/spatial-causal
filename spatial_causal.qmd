@@ -47,7 +47,7 @@ Let $T$ denote the treatment, $Y$ denote the outcome, $S$ denote the spatial coo
 
 ### General omitted variable bias
 
-We first consider the outcome model which is linear in $T$ [(Chernozhukov et al., 2022)](https://www.nber.org/system/files/working_papers/w30302/w30302.pdf): $Y = \beta T + f(X,S,U) + \epsilon$. Since $U$ is unobserved, the "short" regression with observed variables is $Y = \tilde{\beta}T + \tilde{f}(X,S) + \tilde{\epsilon}$. Let $\alpha=\frac{T-E[T|X,S,U]}{E(T-E[T|X,S,U])^2}$, $\tilde{\alpha} =\frac{T-E[T|X,S]}{E(T-E[T|X,S])^2}$, $g=E[Y|T,X,S,U]$, $\tilde{g}=E[Y|T,X,S]$, then $\beta=E[Y\alpha]=E[g\alpha]$, $\tilde{\beta}=E[Y\tilde{\alpha}] =E[\tilde{g}\tilde{\alpha}]$. The omitted variable bias is $\beta - \tilde{\beta} = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]$ and it is bounded by
+We first consider the outcome model which is linear in $T$ [(Chernozhukov et al., 2022)](https://www.nber.org/system/files/working_papers/w30302/w30302.pdf): $Y = \beta T + f(X,S,U) + \epsilon$. $\beta$ is equal to the average causal effect or average causal derivative. Since $U$ is unobserved, the "short" regression with observed variables is $Y = \tilde{\beta}T + \tilde{f}(X,S) + \tilde{\epsilon}$. Let $\alpha=\frac{T-E[T|X,S,U]}{E(T-E[T|X,S,U])^2}$, $\tilde{\alpha} =\frac{T-E[T|X,S]}{E(T-E[T|X,S])^2}$, $g=E[Y|T,X,S,U]$, $\tilde{g}=E[Y|T,X,S]$, then $\beta=E[Y\alpha]=E[g\alpha]$, $\tilde{\beta}=E[Y\tilde{\alpha}] =E[\tilde{g}\tilde{\alpha}]$. The omitted variable bias is $\beta - \tilde{\beta} = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]$ and it is bounded by
 
 ```{=tex}
 \begin{equation}
@@ -63,7 +63,13 @@ where $\rho^2 = Cor^2(g-\tilde{g}, \alpha-\tilde{\alpha})$, $B^2=E(g - \tilde{g}
 ```
 where $S^2 = E(Y-\tilde{g})^2E\tilde{\alpha}^2$ is identifiable, $C_Y^2 = R^2_{Y-\tilde{g}\sim g-\tilde{g}} = \eta_{Y\sim U\mid T,X,S}^2$, $C_T^2 = \frac{1-R^2_{\alpha \sim \tilde{\alpha}}}{R^2_{\alpha \sim \tilde{\alpha}}} = \frac{\eta_{T\sim U \mid X,S}^2}{1-\eta_{T\sim U\mid X,S}^2}$. There are three unidentified parameters $\rho^2$, $\eta_{T\sim U \mid X,S}^2$ and $\eta_{Y\sim U|T,X,S}^2$, which can be benchmarked empirically from observed data.
 
-This result can be extended to more general nonparametric causal models.
+This result can be extended to fully nonparametric causal models and it only requires the target estimand $\beta:= Em(W,g)$ with $W=(T,X,S,U)$ to be a continuous linear functional of the conditional expectation function of the outcome, $g$. Then there exists unique Riesz representer $\alpha(W)$ such that $\beta= Em(W,g) = Eg(W)\alpha(W)$ and $\tilde{\alpha}(\tilde{W})=E[\alpha(W)\mid \tilde{W}]$ where $\tilde{W} = (T,X,S)$. For example, when the treatment is binary and the estimand is average causal effect $\beta=E[Y(1)-Y(0)]$, we have $\alpha(W) = \frac{1(T=1)}{P(T=1\mid X,S,U)} - \frac{1(T=0)}{P(T=0\mid X,S,U)}$. Another example is average causal derivatives for continuous treatment $\alpha(W) = -\partial_t \log f(T\mid X,S,U)$. 
+
+The OVB is still $\beta - \tilde{\beta} = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]$ and it is bounded by $|\tilde{\beta} - \beta|^2 =\rho^2B^2\leq B^2$. The bound can be characterized by $B^2 = S^2C_Y^2C_T^2$ where $S^2$ and $C_Y^2$ have the same interpretations as above, but $C_T^2 = \frac{1-R^2_{\alpha \sim \tilde{\alpha}}}{R^2_{\alpha \sim \tilde{\alpha}}}$ has different forms under different cases. Take average causal effect with a binary treatment as example, $C_T^2 = \frac{E[1/(P(T=1 \mid X,S,U)P(T=0 \mid X,S,U))]}{E[1/(P(T=1 \mid X,S)P(T=0 \mid X,S))]} - 1$. For average causal derivatives, if $T$ is homoscedastic Gaussian conditional on $X$ and $(X,A)$, then $C_T^2$ simplifies to the one in partially linear model. 
+
+For inference, $S$ and $\tilde{\beta}$ in the bound can be estimated via debiased machine learning (DML), which can eliminate the regularization and overfitting bias. The DML estimators are asymptotically linear and Gaussian, so confidence bounds for the sensitivity bounds have asymptotic coverage.
+
+Slides on [causal inference with machine learning](https://congress-files.s3.amazonaws.com/2022-09/Using%20Machine%20Learning%20for%20Causal%20Inference%20in%20Economics.pdf).
 
 ### Partially linear data generating process
 
@@ -75,7 +81,7 @@ Spatial modeling usually considers a partially linear model with spatial pattern
     Y &= \beta_TT + \beta_XX + \beta_UU + W + \epsilon, 
 \end{align}
 ```
-where $Z$ and $W$ are spatial variables, but $U$ is not a fixed measurable function of $S,X$ so it is insufficient to adjust for $S,X$ only. We also assume $U = f(S) + V$, $V \sim N(0,\sigma^2)$, $\delta \sim N(0,\sigma_T^2)$, $\epsilon \sim N(0,\sigma_Y^2)$. Then
+where $Z$ and $W$ are spatial variables, but $U$ is not a fixed measurable function of $S,X$ so it is insufficient to adjust for $S,X$ only. We also assume $U = f(S) + V$, $V \sim N(0,\sigma^2)$, $\delta \sim N(0,\sigma_T^2)$, $\epsilon \sim N(0,\sigma_Y^2)$. The exogeneity variables are independent of all the other variables. Then
 
 ```{=tex}
 \begin{align}
@@ -83,21 +89,31 @@ where $Z$ and $W$ are spatial variables, but $U$ is not a fixed measurable funct
     U \mid T,S,X &\sim N(f(S) + w(T - \alpha_XX - \alpha_Uf(S) - Z), \sigma^2 - \alpha_Uw\sigma^2), \\
     E[Y \mid T,   S,X] &= \beta_TT + \beta_XX  + \beta_UwT + \beta_U(1-\alpha_Uw)f(S) - \beta_Uw\alpha_XX - \beta_UwZ + W, \\
     &= \tilde{\beta}_TT + \tilde{\beta}_XX - \beta_UwZ + W + \tilde{\beta}_U\tilde{f}(S). \\
-    Var(Y\mid T,S,X) &=  \beta_U^2\sigma^2(1-\alpha_Uw) + \sigma_Y^2.
+    Var(Y\mid T,S,X) &=  \beta_U^2\sigma^2(1-\alpha_Uw) + \sigma_Y^2,
 \end{align}
 ```
-In general, $f(S)$, $Z$ and $W$ are not separable. We characterize the omitted confounder bias by comparing to the short regresssion $T = \tilde{\alpha}_XX + \tilde{f}(S) + \tilde{\delta}$ and $Y = \tilde{\beta}_TT + \tilde{\beta}_XX + \tilde{h}(S) + \tilde{\epsilon}$. In this case $\beta_T - \tilde{\beta}_T = E[(g - \tilde{g})(\alpha - \tilde{\alpha})] = -\beta_Uw$. On the other hand, $E(\alpha - \tilde{\alpha})^2 = \frac{1}{\sigma_T^2} - \frac{1}{\alpha_U^2\sigma^2 + \sigma_T^2}$, $E(g - \tilde{g})^2 = \beta_U^2E((1-\alpha_Uw)V-w\epsilon)^2 = \beta_U^2\frac{\sigma^2\sigma_T^2}{\alpha_U^2\sigma^2 + \sigma_T^2}$. Hence we have
+where $w=\frac{\alpha_U\sigma^2}{\alpha_U^2\sigma^2 + \sigma_T^2}=$. In general, $f(S)$, $Z$ and $W$ are not separable. We characterize the omitted confounder bias by comparing to the short regresssion $T = \tilde{\alpha}_XX + \tilde{f}(S) + \tilde{\delta}$ and $Y = \tilde{\beta}_TT + \tilde{\beta}_XX + \tilde{h}(S) + \tilde{\epsilon}$. In this case $\beta_T - \tilde{\beta}_T = E[(g - \tilde{g})(\alpha - \tilde{\alpha})] = -\beta_Uw$. On the other hand, $E(\alpha - \tilde{\alpha})^2 = \frac{1}{\sigma_T^2} - \frac{1}{\alpha_U^2\sigma^2 + \sigma_T^2}$, $E(g - \tilde{g})^2 = \beta_U^2E((1-\alpha_Uw)V-w\delta)^2 = \beta_U^2\frac{\sigma^2\sigma_T^2}{\alpha_U^2\sigma^2 + \sigma_T^2}$. Hence we have
 
 ```{=tex}
 \begin{equation}
     |\tilde{\beta}_T - \beta_T|^2 = E[(g - \tilde{g})(\alpha - \tilde{\alpha})]^2 = E(g - \tilde{g})^2E(\alpha - \tilde{\alpha})^2 = E(Y-\tilde{g})^2E\tilde{\alpha}^2 \eta_{Y\sim U|T,X,S}^2 \frac{\eta_{T\sim U|X,S}^2}{1-\eta_{T\sim U|X,S}^2}.
 \end{equation}
 ```
-This is because $g-\tilde{g} = \beta_U((1-\alpha_Uw)V-w\epsilon) = -\frac{\beta_U\sigma_T^2}{\alpha_U}(\alpha - \tilde{\alpha})$ and $\alpha - \tilde{\alpha}$ are colinear. The bias can be characterized by $\eta_{Y\sim U|T,X,S}^2$ and $\eta_{T\sim U|X,S}^2$ without $\rho^2$. The partially linear model $Y_i=\beta T_i +g(S_i)+\epsilon_i$ can be identified under some smoothness assumptions ([Gilbert et al. 2023](https://arxiv.org/pdf/2308.12181.pdf)).
+This is because $g-\tilde{g} =E[Y\mid T,X,S,U] - E[Y\mid T,X,S]= \beta_U((1-\alpha_Uw)V-w\delta) = -\frac{\beta_U\sigma_T^2}{\alpha_U}(\alpha - \tilde{\alpha})$ and $\alpha - \tilde{\alpha} = \frac{\delta}{\sigma_T^2} - \frac{\alpha_U V+\delta}{\alpha_U^2\sigma^2+\sigma_T^2}$ are colinear. The bias can be characterized by $\eta_{Y\sim U|T,X,S}^2$ and $\eta_{T\sim U|X,S}^2$ without $\rho^2$. The partially linear model $Y_i=\beta T_i +g(S_i)+\epsilon_i$ can be identified under some smoothness assumptions ([Gilbert et al. 2023](https://arxiv.org/pdf/2308.12181.pdf)).
+
+This result holds for the following DGP:
+```{=tex}
+\begin{align} 
+    U = f_U(X,S) + V, \\
+    T &= \alpha_UU + f_T(X,S) + \delta, \\
+    Y &= \beta_TT + \beta_UU + f_Y(X,S) + \epsilon,
+\end{align}
+```
+which does not change $g-\tilde{g}$ and $\alpha - \tilde{\alpha}$. If $U$ does not enter $T$ and $Y$ linearly, $\rho^2$ may not be equal to $1$ and it becomes the above general case. On the other hand, if $Y$ is nonlinear in $T$, the estimand and form of $\alpha$ can be different and we need to discuss case by case.
 
 ### Spatial location only affects the unmeasured confounder
 
-Suppose spatial location only affects potential outcomes and exposure through the unmeasured confounders (Gilbert et al. 2021 Assumptions 3.1 + 3.2 + 3.5, but no 3.3, which leads to non-identification):
+Suppose spatial location only affects potential outcomes and exposure through the unmeasured confounders (Gilbert et al. 2021 Assumptions 3.1 + 3.2 + 3.5, but no 3.3, which leads to non-identification), we focus on the partially linear model:
 
 ```{=tex}
 \begin{align} 
@@ -117,7 +133,7 @@ This result can be generalized to models that are nonlinear in $T$ and $X$. Simu
 
 ### Replications at each $S$ and variables at different resolutions
 
-If at each $S$, $U$ is invariant, but $T$, $Y$, $X$ are not, then case-control matching methods regress the difference between responses in the same region to remove spatial confounding. If $T_i$ (or $Y$) is invariant at location $i$ (treatment at the same scale as unmeasured confounders), the causal effect is not directly identified, but we may use $Y_{ij}-Y_{ik}$ or the outcome model to estimate $\sigma_Y^2$. Then $\eta_{Y\sim U|T,X,S}^2 = \frac{E(g - \tilde{g})^2}{E(Y - \tilde{g})^2} = \frac{E(g - \tilde{g})^2}{E(g - \tilde{g})^2 + \sigma_Y^2}$ is identified from $E(Y - \tilde{g})^2$ and $\sigma_Y^2$. For example, consider the PM2.5 in a region $S_i$ as the treatment, instead of $1$ kilometer resolution. This idea also works for areal data [(Reich et al., 2020)](https://arxiv.org/pdf/2007.02714.pdf). May related to clustered randomized trial, repeated measurements and mixed effect models.
+If at each $S$, $U$ is invariant, but $T$, $Y$, $X$ are not, then case-control matching methods regress the difference between responses in the same region to remove spatial confounding. If $T_i$ (or $Y$) is invariant at location $i$ (treatment at the same scale as unmeasured confounders), the causal effect is not directly identified, but we may use $Y_{ij}-Y_{ik}$ or the outcome model to estimate $\sigma_Y^2$. Then $\eta_{Y\sim U|T,X,S}^2 = \frac{E(g - \tilde{g})^2}{E(Y - \tilde{g})^2} = \frac{E(g - \tilde{g})^2}{E(g - \tilde{g})^2 + \sigma_Y^2}$ is identified from $E(Y - \tilde{g})^2$ and $\sigma_Y^2$. This works for the general nonparametric model. For example, consider the PM2.5 in a region $S_i$ as the treatment, instead of $1$ kilometer resolution. This idea also works for areal data [(Reich et al., 2020)](https://arxiv.org/pdf/2007.02714.pdf). May related to clustered randomized trial, repeated measurements and mixed effect models.
 
 Although we assume positivity for $T$ in the DGP, if we consider $S$ as a covariate and only observe a single $T_i$ for each $S_i$ (treatment does not vary at a smaller scale than the spatial confounder), a potential concern is that it leads to a practical (not structural) violation of positivity/overlap, which is unavoidable when the treatment is continuous and covariate space is high-dimensional [(Zhu et al., 2021)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8492528/). In this case there is no data for us to learn about the counterfactuals at each location and we have to make some smoothness assumptions. The causal conclusions we make rely more on the model extrapolation and less on data itself (Section 3.2 in [Gilbert et al. 2021](https://arxiv.org/pdf/2112.14946.pdf) and [Gelman book, 2006](http://www.stat.columbia.edu/~gelman/arm/chap10.pdf)).
 
