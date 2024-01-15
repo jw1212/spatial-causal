@@ -1,0 +1,381 @@
+---
+title: "Spatial Causal Inference"
+author: Jiaxi Wu
+format:
+  html:
+    # embed-resources: true
+    self-contained: true
+    code-fold: true
+    code-summary: "Show the code"
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+# library(GPfit)
+library(sensemakr)
+library(randomForest) 
+library(INLA)
+library(fmesher)
+```
+
+We consider the effect of PM2.5 exposure on birthweight.
+
+# Preprocess data
+
+View the individual-level data from year $2004$ which contains birthweight, other covariates and city information with population size $\geq 100,000$. [link1](https://www.nber.org/research/data/vital-statistics-natality-birth-data), [link2](https://www.cdc.gov/nchs/data_access/vitalstatsonline.htm).
+
+```{r}
+# birth_2004 <- read.csv(file="../natl2004.csv", nrow=1200000)
+# ca_birth_2004 <- birth_2004[birth_2004$mrstate=="CA",]
+# rm(birth_2004)
+ca_birth_2004 <- read.csv(file="data/ca_birth_2004.csv", nrow=1200000)
+# summary statistics for reference
+summary(ca_birth_2004$dbwt) 
+var(ca_birth_2004$dbwt)
+mean(ca_birth_2004$dbwt[ca_birth_2004$dbwt > 4000 & ca_birth_2004$dbwt < 6000])
+
+# histogram
+hist(ca_birth_2004$dbwt[ca_birth_2004$dbwt < 9999], breaks = 50, freq = FALSE,
+     main = "Histogram of California birthweight in 2004")
+curve(dnorm(x, mean = mean(ca_birth_2004$dbwt), sd = sd(ca_birth_2004$dbwt)), 
+      col = 2, lty = 2, lwd = 2, add = TRUE)
+
+# ks.test(ca_birth_2004$dbwt[ca_birth_2004$dbwt < 9999], 'pnorm') 
+# save CA data
+# write.csv(ca_birth_2004, "data/ca_birth_2004.csv")
+rm(ca_birth_2004)
+```
+
+For the outcome, we estimate ZIP Code-level mean and variance of birthweights from count data (since 2018) for $2022$. Intervals are approximated by midpoints and counts less than $11$ are dropped, which may underestimate the variance. ZIP Codes with number of samples < 50 are excluded. Then we generate random normal samples of individuals based on the estimated distributions.
+
+```{r, warning=FALSE}
+birthweight_cnt <- read.csv("data/bw_count_2019.csv")
+head(birthweight_cnt, 9)
+midpoints <- 1:8 * 500 + 250
+midpoints[8] <- 4500
+
+est_mean_var <- function(birth_count){
+  samples <- c()
+  birth_count <- as.integer(birth_count)
+  for (i in 1:length(midpoints)){
+    # ignore counts < 11
+    if (!is.na(birth_count[i])) {
+      samples <- c(samples, rep(midpoints[i], birth_count[i]))
+    }
+  }
+  return(tibble(bw_mean = mean(samples), bw_prop_low = mean(samples < 2500), bw_var = var(samples), cnt = length(samples)))
+}
+
+# one_zipcode <- birthweight[birthweight$ZIP_Code_of_Residence == 90001,]
+# birth_count <- as.integer(one_zipcode$Total_Births)
+# samples <- c()
+# for (i in 1:nrow(one_zipcode)){
+#   if (!is.na(birth_count[i])) {
+#     samples <- c(samples, rep(midpoints[i], birth_count[i]))
+#   }
+# }
+# hist(rnorm(length(samples), mean(samples), sd(samples)), breaks=20)
+
+birthweight_est <- birthweight_cnt %>% 
+  group_by(ZIP_Code_of_Residence) %>% 
+  summarise(bw_summary = est_mean_var(Total_Births)) %>% 
+  tidyr::unpack(cols = bw_summary)
+summary(birthweight_est) # 2664 zipcodes, 1439 NAs
+birthweight_est <- birthweight_est[birthweight_est$cnt > 100,] # 959 zipcodes
+colnames(birthweight_est)[1] <- "zip"
+```
+We link each ZIP Code with latitude and longitude for spatial modeling. Unequal variance at each location can still be identified if number of observations at each location goes to infinity. To satisfy homoscedasticity, use same variance for sampling at each location.
+
+add more years, 
+for treatment take 0.75 quantiles, number of days above unhealth level
+
+```{r}
+# zipcode <- read.csv("data/uszips.csv")
+# zipcode <- zipcode[,c("zip", "lat", "lng")] # don't need population
+# colnames(zipcode)[3] <- "long"
+# zipcode <- zipcode %>% add_row(zip = 92878, lat = 33.8754, long = -117.5659)
+# birthweight <- merge(x = birthweight_est, y = zipcode, 
+#                          by="zip", all.x=TRUE)
+```
+
+For PM2.5 concentration, use observed data at closest monitors ([raw data from monitors](https://www.epa.gov/outdoor-air-quality-data/download-daily-data)) or prediction from models ([zipcode and 1km resolution PM2.5 before 2017](https://sedac.ciesin.columbia.edu/data/set/aqdh-pm2-5-o3-no2-concentrations-zipcode-contiguous-us-2000-2016)). We obtain annual average PM2.5 concentration for each ZIP code from [daily predictions by ZIP code in 2018](https://www.nature.com/articles/s41597-021-00891-1#Sec2).
+
+```{r}
+# pm25 <- read.csv("data/pm25_2021.csv")
+# head(pm25)
+# summary(pm25) # 172 sites/locations
+# 
+# # may use number of days at unhealthy level instead of mean
+# # concentration over zipcode and time
+# pm25_sites <- pm25 %>%
+#   group_by(Site.ID) %>% 
+#   summarise(pm25_avg = mean(Daily.Mean.PM2.5.Concentration), 
+#             lat = unique(SITE_LATITUDE), long = unique(SITE_LONGITUDE))
+# 
+# pm25_sites %>%
+#   ggplot(aes(x=long, y=lat, color=pm25_avg)) + 
+#   geom_point(alpha=1, size=2) +
+#   theme_bw() 
+# 
+# # predict pm2.5 at the zipcode locations
+
+load("data/california_pm25_pred.RData")
+pm25_2018 <- DF[DF$Date >= "2018-01-01" & !is.na(DF$ZCTA5_code),] 
+rm(DF)
+pm25_2018$Ens_pred[pm25_2018$Ens_pred < 0] <- 0 # pm2.5 should not be < 0
+pm25_2018 <- pm25_2018 %>%
+  group_by(ZCTA5_code) %>% 
+  summarise(pm25_pred_avg = mean(Ens_pred),
+            pm25_num_unhealthy = sum(Ens_pred > 50),
+            lat = unique(Lat), long = unique(Lon))
+birthweight <- merge(x = birthweight_est, y = pm25_2018,
+                     by.x = "zip", by.y = "ZCTA5_code")
+birthweight %>%
+  ggplot(aes(x=long, y=lat, color=bw_mean)) +
+  geom_point(alpha=1, size=2) +
+  theme_bw()
+birthweight %>%
+  ggplot(aes(x=long, y=lat, color=pm25_pred_avg)) +
+  geom_point(alpha=1, size=2) +
+  theme_bw()
+```
+
+From count data of parent giving birth's demographic information like age group, race/ethnicity, education level, and country of birth, we obtain proportions of different categories as ZIP code-level covariates. Treat counts less than $11$ as $0$ and remove empty/unknown categories.
+
+```{r}
+age <- read.csv("data/age_2019.csv")
+age$Total_Births[age$Total_Births == "<11"] = 0
+age_prop <- age %>%
+  group_by(ZIP_Code_of_Residence) %>% 
+  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
+          age = Age) %>% 
+  spread(key=age, value=prop) %>%
+  select_if(colSums(., na.rm = TRUE) > 0) 
+
+race <- read.csv("data/race_2019.csv")
+race$Total_Births[race$Total_Births == "<11"] = 0
+race_prop <- race %>%
+  group_by(ZIP_Code_of_Residence) %>% 
+  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
+          race = Race_Ethnicity) %>% 
+  spread(key=race, value=prop) %>%
+  select_if(colSums(., na.rm = TRUE) != 0) %>%
+  select(!"Unknown or Not Stated")
+
+edu <- read.csv("data/education_2019.csv")
+edu$Total_Births[edu$Total_Births == "<11"] = 0
+edu_prop <- edu %>%
+  group_by(ZIP_Code_of_Residence) %>% 
+  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
+          edu = Education_Level) %>% 
+  spread(key=edu, value=prop) %>%
+  select_if(colSums(., na.rm = TRUE) != 0) %>%
+  select(!Unknown)
+
+country <- read.csv("data/country_2019.csv")
+country$Total_Births[country$Total_Births == "<11"] = 0
+country_prop <- country %>%
+  group_by(ZIP_Code_of_Residence) %>% 
+  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
+          country = US_or_Foreign_Born) %>% 
+  spread(key=country, value=prop) %>%
+  select_if(colSums(., na.rm = TRUE) != 0) %>%
+  select(!Unknown)
+
+# merge data and sample individual outcomes
+list_df <- list(birthweight, age_prop, race_prop, edu_prop, country_prop)
+bw_zipcode <- list_df %>% 
+  reduce(inner_join, by=join_by(zip == ZIP_Code_of_Residence))
+bw_individual <- bw_zipcode %>%
+  rowwise() %>%
+  mutate(samples = list(rnorm(cnt, mean = bw_mean, sd = sqrt(bw_var)))) %>%
+  unnest(cols = samples) 
+
+# naive estimate
+summary(lm(bw_zipcode$bw_mean ~ bw_zipcode$pm25_pred_avg))
+summary(lm(bw_individual$samples ~ bw_individual$pm25_pred_avg))
+```
+zipcode-level modeling consider weights, income
+
+
+# Model
+
+show different types of sensitivity analysese with diff assumptions
+
+## $U$ as a function of $S$
+
+## $S$ only affects $U$ directly
+
+## Zipcode-level modeling
+
+We assume a partially linear structural equation model and use sensmakr and debiased ML to perform sensitivity analysis. Use random forest for partialling out covariates. 
+
+```{r}
+dml_plm <- function(x, t, y, dreg, yreg, nfold=2) {
+  n <- nrow(x) # number of observations
+  foldid <- rep.int(1:nfold, times = ceiling(n/nfold))[sample.int(n)] #define fold indices
+  I <- split(1:n, foldid)  #split observation indices into folds  
+  ytil <- dtil <- rep(NA, n)
+  cat("fold: ")
+  for(b in 1:length(I)){
+    dfit <- dreg(x[-I[[b]],], d[-I[[b]]]) #take a fold out
+    yfit <- yreg(x[-I[[b]],], y[-I[[b]]]) # take a fold out
+    dhat <- predict(dfit, x[I[[b]],], type="response") #predict the left-out fold 
+    yhat <- predict(yfit, x[I[[b]],], type="response") #predict the left-out fold 
+    dtil[I[[b]]] <- (d[I[[b]]] - dhat) #record residual for the left-out fold
+    ytil[I[[b]]] <- (y[I[[b]]] - yhat) #record residial for the left-out fold
+    cat(b," ")
+    }
+  rfit <- lm(ytil ~ dtil)
+  rfitSummary<- summary(rfit)
+  coef.est <-  rfitSummary$coef[2] #extract coefficient
+  se <- rfitSummary$coef[2,2]  #record robust standard error
+  cat(sprintf("\ncoef (se) = %g (%g)\n", coef.est , se))  #printing output
+  return(list(coef.est =coef.est , se=se, dtil=dtil, ytil=ytil)) #save output and residuals 
+}
+
+x <- bw_zipcode[,6:29]
+d <- bw_zipcode$pm25_pred_avg
+y <- bw_zipcode$bw_mean
+
+#DML with Random Forest:
+dreg <- function(x,d){randomForest(x, d)} 
+yreg <- function(x,y){randomForest(x, y)} 
+
+set.seed(111)
+dml_rf = dml_plm(x, d, y, dreg, yreg, nfold=10)
+resY =  dml_rf$ytil
+resD =  dml_rf$dtil
+
+print(c("Controls explain the following fraction of variance of Outcome", 
+        max(1 - var(resY)/var(y), 0)))
+print(c("Controls explain the following fraction of variance of Treatment",
+        max(1 - var(resD)/var(d), 0)))
+
+res_model <- lm(resY ~ resD) 
+dml_sensitivity <- sensemakr(model = res_model, treatment = "resD")
+summary(dml_sensitivity)
+plot(dml_sensitivity, nlevels = 15)
+```
+The causal effect estimate is not statistically significant even without unoberved confounders.
+
+## Individual-level modeling
+
+DML 
+```{r}
+# speed up, parallel
+samples <- sample(1:nrow(bw_individual), nrow(bw_individual)/10)
+x <- bw_individual[samples, 6:29]
+d <- bw_individual$pm25_pred_avg[samples]
+y <- bw_individual$samples[samples]
+
+#DML with Random Forest:
+dreg <- function(x,d){randomForest(x, d)} 
+yreg <- function(x,y){randomForest(x, y)} 
+
+set.seed(111)
+dml_rf_ind = dml_plm(x, d, y, dreg, yreg, nfold=4)
+resY_ind =  dml_rf_ind$ytil
+resD_ind =  dml_rf_ind$dtil
+
+print(c("Controls explain the following fraction of variance of Outcome", 
+        max(1 - var(resY_ind)/var(y), 0)))
+print(c("Controls explain the following fraction of variance of Treatment",
+        max(1 - var(resD_ind)/var(d), 0)))
+
+res_model_ind <- lm(resY_ind ~ resD_ind) 
+dml_sensitivity_ind <- sensemakr(model = res_model_ind, treatment = "resD_ind")
+summary(dml_sensitivity_ind)
+plot(dml_sensitivity_ind, nlevels = 15)
+```
+
+
+Fit INLA without covariates.
+
+```{r}
+samples <- sample(1:nrow(bw_individual), nrow(bw_individual)/10)
+# s <- as.matrix(bw_individual[samples, 6:7])
+s <- as.matrix(bw_zipcode[,6:7])
+t <- bw_zipcode$pm25_pred_avg
+y <- bw_individual$samples[samples]
+
+tibble(f = t, s1 = s[,1], s2 = s[,2]) %>%
+  ggplot(aes(x=s1, y=s2, color=f)) +
+  geom_point(alpha=1, size=2.5) +
+  theme_bw()
+
+mesh1 <- fm_mesh_2d_inla(loc=s, max.edge=c(0.4, 1.2), cutoff=0.2, offset=c(0.5,2))
+plot(mesh1)
+points(s, pch=3, bg=1, col="red", cex=1)
+
+A.est <- inla.spde.make.A(mesh=mesh1, loc=s)
+print(dim(A.est)) # number of data locations * number of mesh nodes
+
+# fit model
+spde <- inla.spde2.matern(mesh=mesh1, alpha=2) 
+formula <- y ~ -1 + intercept + f(spatial.field, model=spde)
+# spatial.field is a index variable?
+result <- inla(formula, 
+               data = list(y=t, intercept=rep(1, spde$n.spde),
+               spatial.field=1:spde$n.spde),
+               control.predictor=list(A=A.est, compute=TRUE))
+
+# round(result$summary.fixed, 3)
+print(round(result$summary.hyperpar, 3))
+cat("posterior mean of sigma_t_tilde_sq =", inla.emarginal(function(x) 1/x, result$marginals.hyper[[1]])) # posterior mean of variance
+```
+Posterior mean $\tilde{\sigma}_T^2$ is around $1.3$.
+
+
+```{r}
+t <- bw_individual$pm25_pred_avg[samples]
+mesh <- fm_mesh_2d_inla(loc=s, max.edge=c(0.25, 1), offset=c(0.5,2))
+plot(mesh)
+points(s, pch=3, bg=1, col="red", cex=1)
+
+# For each observation, index gives the corresponding index into the matrix of measurement locations, and repl determines the corresponding replicate index. 
+A <- inla.spde.make.A(mesh, loc = s, 
+                      index = match(bw_individual[samples,]$zip, bw_zipcode$zip))
+print(dim(A))
+spde <- inla.spde2.matern(mesh=mesh, alpha=2) 
+
+# index the full mesh and replicates
+mesh.index <- inla.spde.make.index(name = "field", n.spde = spde$n.spde)
+
+# stack the predictor information
+stack <- inla.stack(data = list(y = y), A = list(A, 1),
+                    effects = list(c(mesh.index, list(intercept = 1)),
+                                   list(cov = t, loc = samples)), tag = "est")
+
+# fit model
+formula <- y ~ -1 + intercept + cov + f(field, model = spde, replicate = field.repl) + f(loc, model = "iid")
+rep_result <- inla(formula, data = inla.stack.data(stack, spde = spde),
+                   family = "normal",
+                   control.predictor = list(A = inla.stack.A(stack),
+                                             compute = TRUE))
+print(round(rep_result$summary.fixed, 3))
+print(round(rep_result$summary.hyperpar, 3))
+cat("posterior mean of sigma_y_tilde_sq - sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[4]]), '\n')
+cat("posterior mean of sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[1]])) 
+
+posterior_beta_tilde <- rep_result$marginals.fixed[[2]]
+plot(posterior_beta_tilde, type = "l", xlab = 'beta_t_tilde', ylab = 'density',
+     main = "Posterior density of beta_t_tilde")
+
+posterior_sigma_y_sq <- rep_result$marginals.hyperpar[[1]]
+posterior_sigma_y_sq[,1] <- 1 / posterior_sigma_y_sq[,1]
+plot(posterior_sigma_y_sq, type = "l", xlab = 'sigma_y_sq', ylab = 'density',
+     main = "Posterior density of sigma_y_sq")
+
+posterior_sigma_y_tilde_sq <- rep_result$marginals.hyperpar[[4]]
+posterior_sigma_y_tilde_sq[,1] <- 1 / posterior_sigma_y_tilde_sq[,1] +
+  posterior_sigma_y_sq[,1]
+plot(posterior_sigma_y_tilde_sq, type = "l", xlab = 'sigma_y_tilde_sq', ylab = 'density',
+     main = "Posterior density of sigma_y_tilde_sq")
+```
+
+
+
+
+
