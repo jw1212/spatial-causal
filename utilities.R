@@ -55,8 +55,7 @@ get_residuals <- function(x, y, model, nfold=5) {
 }
 
 ## format percentages
-format.perc <- function(probs, digits)
-{
+format.perc <- function(probs, digits) {
   paste(format(100 * probs,
                trim = TRUE,
                scientific = FALSE,
