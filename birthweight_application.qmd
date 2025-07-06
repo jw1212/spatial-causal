@@ -1,381 +1,1334 @@
 ---
-title: "Spatial Causal Inference"
-author: Jiaxi Wu
-format:
-  html:
-    # embed-resources: true
-    self-contained: true
-    code-fold: true
-    code-summary: "Show the code"
+title: "Birthweight Application"
+format: pdf
 editor: visual
 ---
 
 ```{r}
 library(tidyverse)
-# library(GPfit)
-library(sensemakr)
+library(truncdist)
+library(nnet)
+library(car)
 library(randomForest) 
-library(INLA)
-library(fmesher)
+library(tidybayes)
+library(bayesplot)
+# library(colorspace)
+
+library(tigris)
+library(sf)
+library(raster)
+library(rasterVis)
+library(exactextractr)
+
+source("utilities.R")
 ```
 
-We consider the effect of PM2.5 exposure on birthweight.
-
-# Preprocess data
-
-View the individual-level data from year $2004$ which contains birthweight, other covariates and city information with population size $\geq 100,000$. [link1](https://www.nber.org/research/data/vital-statistics-natality-birth-data), [link2](https://www.cdc.gov/nchs/data_access/vitalstatsonline.htm).
-
+Imputation functions.
 ```{r}
-# birth_2004 <- read.csv(file="../natl2004.csv", nrow=1200000)
-# ca_birth_2004 <- birth_2004[birth_2004$mrstate=="CA",]
-# rm(birth_2004)
-ca_birth_2004 <- read.csv(file="data/ca_birth_2004.csv", nrow=1200000)
-# summary statistics for reference
-summary(ca_birth_2004$dbwt) 
-var(ca_birth_2004$dbwt)
-mean(ca_birth_2004$dbwt[ca_birth_2004$dbwt > 4000 & ca_birth_2004$dbwt < 6000])
-
-# histogram
-hist(ca_birth_2004$dbwt[ca_birth_2004$dbwt < 9999], breaks = 50, freq = FALSE,
-     main = "Histogram of California birthweight in 2004")
-curve(dnorm(x, mean = mean(ca_birth_2004$dbwt), sd = sd(ca_birth_2004$dbwt)), 
-      col = 2, lty = 2, lwd = 2, add = TRUE)
-
-# ks.test(ca_birth_2004$dbwt[ca_birth_2004$dbwt < 9999], 'pnorm') 
-# save CA data
-# write.csv(ca_birth_2004, "data/ca_birth_2004.csv")
-rm(ca_birth_2004)
-```
-
-For the outcome, we estimate ZIP Code-level mean and variance of birthweights from count data (since 2018) for $2022$. Intervals are approximated by midpoints and counts less than $11$ are dropped, which may underestimate the variance. ZIP Codes with number of samples < 50 are excluded. Then we generate random normal samples of individuals based on the estimated distributions.
-
-```{r, warning=FALSE}
-birthweight_cnt <- read.csv("data/bw_count_2019.csv")
-head(birthweight_cnt, 9)
-midpoints <- 1:8 * 500 + 250
-midpoints[8] <- 4500
-
-est_mean_var <- function(birth_count){
-  samples <- c()
-  birth_count <- as.integer(birth_count)
-  for (i in 1:length(midpoints)){
-    # ignore counts < 11
-    if (!is.na(birth_count[i])) {
-      samples <- c(samples, rep(midpoints[i], birth_count[i]))
+impute_prop <- function(df, imp_cols, N_col, bounds = c(1L, 10L)) {
+  Y_imp <- as.matrix(df[, imp_cols])
+  N_vec <- df[[N_col]]
+  
+  prop_vec <- colMeans(Y_imp / N_vec, na.rm = TRUE) + 1e-10
+  for (i in seq_len(nrow(Y_imp))) {
+    miss_k <- which(is.na(Y_imp[i, ]))
+    if (!length(miss_k)) next
+  
+    R <- N_vec[i] - sum(Y_imp[i, ], na.rm = TRUE)   # births to allocate
+    if (R <= 0) next
+  
+    p <- prop_vec[miss_k]
+    p <- p / sum(p)                      # renormalise over *missing* cats
+  
+    ## raw allocation & integer rounding
+    alloc <- round(p * R)
+    diff <- R - sum(alloc)
+  
+    ## adjust for rounding error
+    if (diff > 0) {                     # distribute leftover 1‑by‑1
+      alloc[order(-p)][seq_len(diff)] <- alloc[order(-p)][seq_len(diff)] + 1
+    } else if (diff < 0) {              # subtract if we overshot
+      alloc[order(p)][seq_len(-diff)] <- alloc[order(p)][seq_len(-diff)] - 1
     }
+  
+    ## enforce 1–10 bounds
+    alloc <- pmin(pmax(alloc, bounds[1]), bounds[2])
+  
+    ## final tidy‑up so the row still sums to N[i]
+    diff <- R - sum(alloc)
+    while (diff != 0) {
+      if (diff > 0) {
+        cand <- which(alloc < bounds[2])
+        if (length(cand) == 0) {
+          break
+        }
+        pick <- if (length(cand) == 1) cand else sample(cand, 1)
+        alloc[pick] <- alloc[pick] + 1
+        diff <- diff - 1
+      } else {
+        cand <- which(alloc > bounds[1])
+        if (length(cand) == 0) {
+          break
+        }
+        pick <- if (length(cand) == 1) cand else sample(cand, 1)
+        alloc[pick] <- alloc[pick] - 1
+        diff <- diff + 1
+      }
+    }
+    Y_imp[i, miss_k] <- alloc
   }
-  return(tibble(bw_mean = mean(samples), bw_prop_low = mean(samples < 2500), bw_var = var(samples), cnt = length(samples)))
+  storage.mode(Y_imp) <- "integer"
+  df[, imp_cols] <- Y_imp
+  df
 }
 
-# one_zipcode <- birthweight[birthweight$ZIP_Code_of_Residence == 90001,]
-# birth_count <- as.integer(one_zipcode$Total_Births)
-# samples <- c()
-# for (i in 1:nrow(one_zipcode)){
-#   if (!is.na(birth_count[i])) {
-#     samples <- c(samples, rep(midpoints[i], birth_count[i]))
-#   }
-# }
-# hist(rnorm(length(samples), mean(samples), sd(samples)), breaks=20)
+impute_quasipoisson <- function(Y_df, X_df, imp_cols, 
+                                N_col="total_birth", bounds = c(1L, 10L)) {
+  Y_imp <- as.matrix(Y_df[, imp_cols])
+  N_vec <- Y_df[[N_col]]
+  merged_df <- Y_df %>% 
+    dplyr::select(-total_birth) %>%
+    inner_join(X_df, by = c("zip", "year")) %>%
+    mutate(log_N = log(!!sym(N_col)))
+  colnames(merged_df) <- make.names(colnames(merged_df))
+  fits <- purrr::map(make.names(imp_cols), function(col) {
+    glm(
+      formula = as.formula(paste0(col, " ~ pm25 + median_income + factor(year) + offset(log_N)")),
+      family  = quasipoisson,
+      # offset  = log(N_vec),
+      data    = merged_df,
+      subset  = !is.na(merged_df[[col]])
+    )
+  })
+  names(fits) <- make.names(imp_cols)
+  
+  for (row in seq_len(nrow(Y_imp))) {
+    miss_k <- which(is.na(Y_imp[row, ]))
+    if (!length(miss_k)) next
+  
+    R <- N_vec[row] - sum(Y_imp[row, ], na.rm = TRUE)   # births to allocate
+    if (R <= 0) next
+    
+    ## predicted counts (λ) for each missing category
+    lam <- purrr::map_dbl(make.names(imp_cols)[miss_k], function(col) {
+      predict(fits[[col]], newdata = merged_df[row, , drop = FALSE], type = "response")
+    })
 
-birthweight_est <- birthweight_cnt %>% 
-  group_by(ZIP_Code_of_Residence) %>% 
-  summarise(bw_summary = est_mean_var(Total_Births)) %>% 
-  tidyr::unpack(cols = bw_summary)
-summary(birthweight_est) # 2664 zipcodes, 1439 NAs
-birthweight_est <- birthweight_est[birthweight_est$cnt > 100,] # 959 zipcodes
-colnames(birthweight_est)[1] <- "zip"
+    ## renormalise to R births
+    lam_norm <- lam / sum(lam) * R
+  
+    ## raw allocation & integer rounding
+    alloc <- round(lam_norm)
+    # diff <- R - sum(alloc)
+    # 
+    # ## adjust for rounding error
+    # if (diff > 0) {                     # distribute leftover 1‑by‑1
+    #   alloc[order(-lam_norm)][seq_len(diff)] <- alloc[order(-lam_norm)][seq_len(diff)] + 1
+    # } else if (diff < 0) {              # subtract if we overshot
+    #   alloc[order(lam_norm)][seq_len(-diff)] <- alloc[order(lam_norm)][seq_len(-diff)] - 1
+    # }
+  
+    ## enforce 1–10 bounds
+    alloc <- pmin(pmax(alloc, bounds[1]), bounds[2])
+  
+    ## final tidy‑up so the row still sums to N[i], not necessary
+    # diff <- R - sum(alloc)
+    # while (diff != 0) {
+    #   if (diff > 0) {
+    #     cand <- which(alloc < bounds[2])
+    #     if (length(cand) == 0) {
+    #       break
+    #     }
+    #     pick <- if (length(cand) == 1) cand else sample(cand, 1)
+    #     alloc[pick] <- alloc[pick] + 1
+    #     diff <- diff - 1
+    #   } else {
+    #     cand <- which(alloc > bounds[1])
+    #     if (length(cand) == 0) {
+    #       break
+    #     }
+    #     pick <- if (length(cand) == 1) cand else sample(cand, 1)
+    #     alloc[pick] <- alloc[pick] - 1
+    #     diff <- diff + 1
+    #   }
+    # }
+    Y_imp[row, miss_k] <- alloc
+  }
+  storage.mode(Y_imp) <- "integer"
+  Y_df[, imp_cols] <- Y_imp
+  Y_df
+}
+
 ```
-We link each ZIP Code with latitude and longitude for spatial modeling. Unequal variance at each location can still be identified if number of observations at each location goes to infinity. To satisfy homoscedasticity, use same variance for sampling at each location.
 
-add more years, 
-for treatment take 0.75 quantiles, number of days above unhealth level
-
+Birthweight summary.
 ```{r}
-# zipcode <- read.csv("data/uszips.csv")
-# zipcode <- zipcode[,c("zip", "lat", "lng")] # don't need population
-# colnames(zipcode)[3] <- "long"
-# zipcode <- zipcode %>% add_row(zip = 92878, lat = 33.8754, long = -117.5659)
-# birthweight <- merge(x = birthweight_est, y = zipcode, 
-#                          by="zip", all.x=TRUE)
-```
+estimate_birthweight_stats <- function(birth_num,
+                                       total_n,
+                                       method = c("midpoint", "normal", "lognormal"),
+                                       bin_lower = c(500, 1000, 1500, 2000, 2500, 3000, 3500, 4000),
+                                       bin_upper = c(999, 1499, 1999, 2499, 2999, 3499, 3999, 5999),
+                                       interval_mean = c(750, 1250, 1750, 2250, 2750, 3250, 3750, 4250),
+                                       prop_cutoff = 2500,
+                                       min_normal_n = 50) {
+  
+  method <- match.arg(method)
+  k <- length(bin_lower)
+  if (length(birth_num) != k)
+    stop("birth_count must have length ", k)
+  if (total_n == 0) {
+    return(tibble(
+      bw_mean = NA,
+      bw_prop_low = NA,
+      bw_var = NA,
+    ))
+  }
+  
+  if (total_n < min_normal_n) {
+    method <- "midpoint"
+  }
+  
+  # Estimate proportion < prop_cutoff (e.g., 2500g)
+  idx_less <- which(bin_upper <= prop_cutoff)
+  prop_low <- sum(birth_num[idx_less]) / total_n
 
-For PM2.5 concentration, use observed data at closest monitors ([raw data from monitors](https://www.epa.gov/outdoor-air-quality-data/download-daily-data)) or prediction from models ([zipcode and 1km resolution PM2.5 before 2017](https://sedac.ciesin.columbia.edu/data/set/aqdh-pm2-5-o3-no2-concentrations-zipcode-contiguous-us-2000-2016)). We obtain annual average PM2.5 concentration for each ZIP code from [daily predictions by ZIP code in 2018](https://www.nature.com/articles/s41597-021-00891-1#Sec2).
-
-```{r}
-# pm25 <- read.csv("data/pm25_2021.csv")
-# head(pm25)
-# summary(pm25) # 172 sites/locations
-# 
-# # may use number of days at unhealthy level instead of mean
-# # concentration over zipcode and time
-# pm25_sites <- pm25 %>%
-#   group_by(Site.ID) %>% 
-#   summarise(pm25_avg = mean(Daily.Mean.PM2.5.Concentration), 
-#             lat = unique(SITE_LATITUDE), long = unique(SITE_LONGITUDE))
-# 
-# pm25_sites %>%
-#   ggplot(aes(x=long, y=lat, color=pm25_avg)) + 
-#   geom_point(alpha=1, size=2) +
-#   theme_bw() 
-# 
-# # predict pm2.5 at the zipcode locations
-
-load("data/california_pm25_pred.RData")
-pm25_2018 <- DF[DF$Date >= "2018-01-01" & !is.na(DF$ZCTA5_code),] 
-rm(DF)
-pm25_2018$Ens_pred[pm25_2018$Ens_pred < 0] <- 0 # pm2.5 should not be < 0
-pm25_2018 <- pm25_2018 %>%
-  group_by(ZCTA5_code) %>% 
-  summarise(pm25_pred_avg = mean(Ens_pred),
-            pm25_num_unhealthy = sum(Ens_pred > 50),
-            lat = unique(Lat), long = unique(Lon))
-birthweight <- merge(x = birthweight_est, y = pm25_2018,
-                     by.x = "zip", by.y = "ZCTA5_code")
-birthweight %>%
-  ggplot(aes(x=long, y=lat, color=bw_mean)) +
-  geom_point(alpha=1, size=2) +
-  theme_bw()
-birthweight %>%
-  ggplot(aes(x=long, y=lat, color=pm25_pred_avg)) +
-  geom_point(alpha=1, size=2) +
-  theme_bw()
-```
-
-From count data of parent giving birth's demographic information like age group, race/ethnicity, education level, and country of birth, we obtain proportions of different categories as ZIP code-level covariates. Treat counts less than $11$ as $0$ and remove empty/unknown categories.
-
-```{r}
-age <- read.csv("data/age_2019.csv")
-age$Total_Births[age$Total_Births == "<11"] = 0
-age_prop <- age %>%
-  group_by(ZIP_Code_of_Residence) %>% 
-  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
-          age = Age) %>% 
-  spread(key=age, value=prop) %>%
-  select_if(colSums(., na.rm = TRUE) > 0) 
-
-race <- read.csv("data/race_2019.csv")
-race$Total_Births[race$Total_Births == "<11"] = 0
-race_prop <- race %>%
-  group_by(ZIP_Code_of_Residence) %>% 
-  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
-          race = Race_Ethnicity) %>% 
-  spread(key=race, value=prop) %>%
-  select_if(colSums(., na.rm = TRUE) != 0) %>%
-  select(!"Unknown or Not Stated")
-
-edu <- read.csv("data/education_2019.csv")
-edu$Total_Births[edu$Total_Births == "<11"] = 0
-edu_prop <- edu %>%
-  group_by(ZIP_Code_of_Residence) %>% 
-  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
-          edu = Education_Level) %>% 
-  spread(key=edu, value=prop) %>%
-  select_if(colSums(., na.rm = TRUE) != 0) %>%
-  select(!Unknown)
-
-country <- read.csv("data/country_2019.csv")
-country$Total_Births[country$Total_Births == "<11"] = 0
-country_prop <- country %>%
-  group_by(ZIP_Code_of_Residence) %>% 
-  reframe(prop = as.integer(Total_Births) / sum(as.integer(Total_Births)), 
-          country = US_or_Foreign_Born) %>% 
-  spread(key=country, value=prop) %>%
-  select_if(colSums(., na.rm = TRUE) != 0) %>%
-  select(!Unknown)
-
-# merge data and sample individual outcomes
-list_df <- list(birthweight, age_prop, race_prop, edu_prop, country_prop)
-bw_zipcode <- list_df %>% 
-  reduce(inner_join, by=join_by(zip == ZIP_Code_of_Residence))
-bw_individual <- bw_zipcode %>%
-  rowwise() %>%
-  mutate(samples = list(rnorm(cnt, mean = bw_mean, sd = sqrt(bw_var)))) %>%
-  unnest(cols = samples) 
-
-# naive estimate
-summary(lm(bw_zipcode$bw_mean ~ bw_zipcode$pm25_pred_avg))
-summary(lm(bw_individual$samples ~ bw_individual$pm25_pred_avg))
-```
-zipcode-level modeling consider weights, income
-
-
-# Model
-
-show different types of sensitivity analysese with diff assumptions
-
-## $U$ as a function of $S$
-
-## $S$ only affects $U$ directly
-
-## Zipcode-level modeling
-
-We assume a partially linear structural equation model and use sensmakr and debiased ML to perform sensitivity analysis. Use random forest for partialling out covariates. 
-
-```{r}
-dml_plm <- function(x, t, y, dreg, yreg, nfold=2) {
-  n <- nrow(x) # number of observations
-  foldid <- rep.int(1:nfold, times = ceiling(n/nfold))[sample.int(n)] #define fold indices
-  I <- split(1:n, foldid)  #split observation indices into folds  
-  ytil <- dtil <- rep(NA, n)
-  cat("fold: ")
-  for(b in 1:length(I)){
-    dfit <- dreg(x[-I[[b]],], d[-I[[b]]]) #take a fold out
-    yfit <- yreg(x[-I[[b]],], y[-I[[b]]]) # take a fold out
-    dhat <- predict(dfit, x[I[[b]],], type="response") #predict the left-out fold 
-    yhat <- predict(yfit, x[I[[b]],], type="response") #predict the left-out fold 
-    dtil[I[[b]]] <- (d[I[[b]]] - dhat) #record residual for the left-out fold
-    ytil[I[[b]]] <- (y[I[[b]]] - yhat) #record residial for the left-out fold
-    cat(b," ")
+  if (method == "midpoint") {
+    # Grouped-data mean and variance
+    grouped_mean <- sum(interval_mean * birth_num) / total_n
+    grouped_var <- sum(birth_num * (interval_mean - grouped_mean)^2) / (total_n - 1)
+    
+    return(tibble(
+      bw_mean = grouped_mean,
+      bw_prop_low = prop_low,
+      bw_var = grouped_var,
+    ))
+    
+  } else if (method == "normal") {
+    # Define log-likelihood for normal
+    loglik_normal <- function(params) {
+      mu <- params[1]
+      sigma <- params[2]
+      if (sigma <= 0) return(Inf)
+      probs <- pnorm(bin_upper, mu, sigma) - pnorm(bin_lower, mu, sigma)
+      -sum(birth_num * log(probs + 1e-12))  # small offset avoids log(0)
     }
-  rfit <- lm(ytil ~ dtil)
-  rfitSummary<- summary(rfit)
-  coef.est <-  rfitSummary$coef[2] #extract coefficient
-  se <- rfitSummary$coef[2,2]  #record robust standard error
-  cat(sprintf("\ncoef (se) = %g (%g)\n", coef.est , se))  #printing output
-  return(list(coef.est =coef.est , se=se, dtil=dtil, ytil=ytil)) #save output and residuals 
+    
+    # Optimize
+    start <- c(mu = 3200, sigma = 500)
+    fit <- optim(
+      par = start,
+      fn = loglik_normal,
+      method = "BFGS"
+      # method = "L-BFGS-B",
+      # lower = c(2000, 200000),
+      # upper = c(4000, 400000)
+    )
+    
+    est_mu <- fit$par[1]
+    est_sigma <- fit$par[2]
+    # prop_low <- pnorm(prop_cutoff, mean = est_mu, sd = est_sigma)
+    
+    return(tibble(
+      bw_mean = est_mu,
+      bw_prop_low = prop_low,
+      bw_var = est_sigma^2,
+    ))
+  } else if (method == "lognormal") {
+
+  ## ---- log‑likelihood for a log‑normal distribution --------------------
+  ##     ln(X) ~ N(mu, sigma^2)
+  loglik_lognormal <- function(params) {
+    mu    <- params[1]          # mean of ln(birth‑weight)
+    sigma <- params[2]          # sd   of ln(birth‑weight)
+    if (sigma <= 0) return(Inf)
+
+    # Bin probabilities:  P(L ≤ X ≤ U) = Φ((lnU − μ)/σ) − Φ((lnL − μ)/σ)
+    probs <- pnorm(log(bin_upper), mu, sigma) -
+             pnorm(log(bin_lower), mu, sigma)
+
+    -sum(birth_num * log(probs + 1e-12))   # small offset avoids log(0)
+  }
+
+  ## ---- optimisation ----------------------------------------------------
+  start <- c(mu = log(3200),   # log of a plausible median (g)
+             sigma = 0.5)      # ~55% CV on original scale
+
+  fit <- optim(
+    par    = start,
+    fn     = loglik_lognormal,
+    method = "BFGS"
+  )
+
+  est_mu    <- fit$par[1]      # meanlog
+  est_sigma <- fit$par[2]      # sdlog
+
+  ## ---- convert to original (gram) scale --------------------------------
+  bw_mean <- exp(est_mu + est_sigma^2 / 2)                     # E[X]
+  bw_var  <- (exp(est_sigma^2) - 1) * exp(2 * est_mu + est_sigma^2)  # Var[X]
+
+  # bw_prop_low <- plnorm(prop_cutoff, meanlog = est_mu, sdlog = est_sigma)
+
+  return(tibble(
+    bw_mean      = bw_mean,        # mean birth‑weight (g)
+    bw_prop_low  = prop_low,
+    bw_var       = bw_var,         # variance on original scale
+    # mu_log       = est_mu,         # mean of ln(X)  
+    # sigma_log    = est_sigma       # sd   of ln(X)
+  ))
+  }
+}
+```
+
+DML model and CI.
+```{r}
+get_gam_ci <- function(fit, variable, alpha = 0.05) {
+  p_table <- summary(fit)$p.table
+  
+  if (!(variable %in% rownames(p_table))) {
+    stop(paste("Variable", variable, "not found in model summary."))
+  }
+  
+  estimate <- p_table[variable, "Estimate"]
+  se <- p_table[variable, "Std. Error"]
+  
+  z_val <- qnorm(1 - alpha / 2)
+  lower <- estimate - z_val * se
+  upper <- estimate + z_val * se
+  
+  cat(variable, "estimate:", estimate, "\n")
+  cat(100 * (1 - alpha), "% CI: [", lower, ", ", upper, "]\n")
+  
+  return(c(estimate = estimate, lower = lower, upper = upper))
+}
+```
+
+## Preprocess data
+
+### Total birth count and index
+
+First calculate total birth count from gender and birth type data for each zipcode and year. Need to keep small zipcodes.
+```{r}
+gender_df <- read.csv("data/ca_sex_2018To2024.csv")
+type_df <- read.csv("data/ca_birthtype_2018To2024.csv")
+birth_count_df <- read.csv("data/ca_birth_count.csv")
+
+gender_total <- gender_df %>%
+  mutate(
+    Total_Births = suppressWarnings(as.numeric(Total_Births))
+  ) %>%
+  dplyr::select(zip = ZIP_Code_of_Residence, year = Year_of_Birth, Sex_of_Child, Total_Births) %>%
+  pivot_wider(names_from = Sex_of_Child, values_from = Total_Births) %>%
+  mutate(total_births_gender = Female +  Male) %>%
+  dplyr::select(zip, year, total_births_gender)
+type_total <- type_df %>%
+  mutate(
+    Total_Births = suppressWarnings(as.numeric(Total_Births))
+  ) %>%
+  dplyr::select(zip = ZIP_Code_of_Residence, year = Year_of_Birth, Type_of_Birth_Plurality, Total_Births) %>%
+  pivot_wider(names_from = Type_of_Birth_Plurality, values_from = Total_Births) %>%
+  mutate(total_births_type = Single + Twin + `Three or more` +  Unknown) %>%
+  dplyr::select(zip, year, total_births_type)
+
+count_before_2023 <- birth_count_df %>%
+  dplyr::select(zip = ZIP_Code, year = Year, count = Count) %>% 
+  filter(year >= 2018) 
+# birth_count_df[birth_count_df$zip %in% setdiff(birth_count_df$zip, index_df$zip),] %>% group_by(zip) %>% filter(all(count > 20))
+
+# Apply logic: if either gender is NA or 0, then total = 0, at least 10 total births
+index_df <- gender_total %>%
+  left_join(type_total, by = c("zip", "year")) %>%
+  # left_join(count_before_2023, by = c("zip", "year")) %>%
+  mutate(
+    total_birth = coalesce(total_births_gender, total_births_type) # , count
+  ) %>%
+  dplyr::select(zip, year, total_birth) %>%
+  group_by(zip) %>%
+  filter(all(!is.na(total_birth) & total_birth > 10)) %>%
+  # filter(all(!is.na(total_birth) & total_birth >= 20)) %>% && mean(total_birth) >= 20
+  ungroup() %>%
+  arrange(zip, year)
+```
+
+### PM2.5 and income
+
+Load average PM2.5 in 2018 and make a heatmap.
+````{r}
+# aggregate pm2.5 and zipcode data
+pm25_raster <- raster("data/V6GL02.02.CNNPM25.NA.201701-201712.nc")
+ca <- states()   # all US states
+ca <- ca[ca$STUSPS == "CA", ]
+pm25_ca <- crop(pm25_raster, ca)
+pm25_ca <- mask(pm25_ca, ca)
+
+# Convert raster to a data frame with coordinates
+pm25_df <- as.data.frame(pm25_ca, xy = TRUE)
+colnames(pm25_df) <- c("long", "lat", "pm25")
+# 'as.data.frame' will have columns x, y, and the name of the raster layer (e.g., 'layer').
+
+# Convert boundary to an sf object for easy plotting in ggplot
+# If used tigris::states() and subset, it's already an sf object
+ca_sf <- st_as_sf(ca)  # may not be needed if 'ca' is already sf
+
+# p_pm25 <-
+ggplot() +
+  geom_raster(
+    data = pm25_df,
+    aes(x = long, y = lat, fill = pm25), 
+    na.rm = TRUE  # 'layer' might differ if your raster has a different name
+  ) +
+  geom_sf(
+    data = ca_sf,
+    fill = NA,
+    color = "transparent",
+    size = 0.1
+  ) +
+  scale_fill_viridis_c(
+    name = "PM2.5 (µg/m³)",
+    option = "magma",  # or "viridis", "cividis", etc.
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Average Daily PM2.5 Levels in California (2018)",
+    x = NULL, # "Longitude",
+    y = NULL, # "Latitude"
+  ) +
+  theme_minimal()
+
+# ggsave("ca_pm25_2018.pdf", p_pm25, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+Use polygons from the package *tigris* to calculate average pm2.5 for each zipcode and compare with raw estimate at high resolution as above. Merge pm2.5 data with zipcode centroid coordinates.
+```{r}
+# 1. Load all ZCTAs
+zctas_all <- zctas(cb = TRUE, year = 2020)
+
+# 2. Load California state boundary and match CRS
+ca <- states(cb = TRUE, year = 2020) %>%
+  filter(STUSPS == "CA") %>%
+  st_transform(crs = st_crs(zctas_all))
+
+# 3. Spatial intersection to keep only CA ZIPs
+zctas_ca <- st_intersection(zctas_all, ca)
+
+# 4. Remove GEOMETRYCOLLECTIONs
+zctas_ca <- zctas_ca %>%
+  filter(st_geometry_type(.) != "GEOMETRYCOLLECTION")
+
+# 5. Fix any invalid geometries
+zctas_ca <- st_make_valid(zctas_ca)
+
+# 6. Cast to MULTIPOLYGON for consistency
+zctas_ca <- st_cast(zctas_ca, "MULTIPOLYGON")
+
+# 7) List all relevant NetCDF files (e.g. V6GL02.02 for 2017–2023)
+raster_files <- list.files(
+  path = "data/",
+  pattern = "V6GL02.*\\.nc$",
+  full.names = TRUE
+)
+
+# 8) extract pm25
+for (file_path in raster_files) {
+    # Extract the year from the file name
+    year <- gsub(".*V6GL02.*\\.(\\d{4}).*", "\\1", file_path)
+    message("Processing year: ", year)
+    # Load the raster file
+    pm25_raster <- raster(file_path)
+    
+    # Ensure CRS matches
+    if (st_crs(zctas_ca) != crs(pm25_raster)) {
+      zctas_ca <- st_transform(zctas_ca, crs(pm25_raster))
+    }
+    # Extract annual mean PM2.5 values for the year
+    zctas_ca[[paste0("pm25_", year)]] <- exact_extract(pm25_raster, zctas_ca, 'mean') 
 }
 
-x <- bw_zipcode[,6:29]
-d <- bw_zipcode$pm25_pred_avg
-y <- bw_zipcode$bw_mean
+
+# 9. Extract centroids and combine with PM2.5 columns
+pm25_zip_data <- zctas_ca %>%
+  st_centroid() %>%
+  mutate(
+    zip = as.numeric(as.character(ZCTA5CE20)),
+    long = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  dplyr::select(zip, long, lat, starts_with("pm25_")) %>%
+  arrange(zip)
+
+ggplot(zctas_ca) +
+  geom_sf(aes(fill = pm25_2018)) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey50") +  # Adjust color scale as needed
+  labs(title = "PM2.5 Levels by ZIP Code",
+       fill = "PM2.5 Level") +
+  theme_minimal()
+```
+
+```{r}
+pm25_long <- pm25_zip_data %>%
+  pivot_longer(
+    cols = starts_with("pm25_"), # Select columns pm25_2017 to pm25_2023
+    names_to = "year",          # New column name for years
+    names_prefix = "pm25_",     # Remove the "pm25_" prefix
+    values_to = "pm25"          # New column name for pm25 values
+  ) %>%
+  mutate(year = as.integer(year) + 1) %>% # zip = as.integer(zip),
+  group_by(zip) %>%
+  mutate(pm25 = ifelse(year < max(year), 0.999*pm25 + 0.001*lead(pm25), pm25)) %>%
+  ungroup() 
+```
+
+Load median household income for each year and zipcode.
+```{r}
+# Define a mapping of year to median income column code
+income_info <- tibble::tibble(
+  year = 2017:2023,
+  filename = paste0("data/income_zipcode_", year, ".csv"),
+  income_col = c("AH1PE001", "AJZAE001", "ALW1E001", "AMR8E001", "AOQIE001", "AQP6E001", "ASQPE001")
+)
+
+# Function to load and process each file
+load_income_data <- function(file, income_col, year) {
+  read_csv(file, show_col_types = FALSE) %>%
+    mutate(zip = str_extract(NAME_E, "\\d{5}")) %>%
+    dplyr::select(zip, median_income = all_of(income_col)) %>%
+    mutate(
+      zip = as.numeric(zip),
+      year = year + 1,
+      median_income = as.numeric(median_income)
+    )
+}
+
+# Apply function to each row in the mapping table
+income_all_years <- pmap_dfr(
+  income_info,
+  ~ load_income_data(..2, ..3, ..1)  # filename, income_col, year
+)
+
+# View result
+head(income_all_years)
+```
+
+```{r}
+non_missing_df <- index_df %>%
+  left_join(pm25_long, by = c("zip", "year")) %>%
+  left_join(income_all_years, by = c("zip", "year")) %>%
+  arrange(zip, year)
+
+non_missing_df <- non_missing_df %>%
+  group_by(zip) %>%
+  filter(all(!is.na(pm25) & median_income > 0)) %>%
+  mutate(median_income = ifelse(is.na(median_income), mean(median_income, na.rm = TRUE), median_income)) %>%
+  ungroup()
+
+# non_missing_df <- non_missing_df %>%
+#   group_by(zip) %>%
+#   mutate(pm25 = if_else(is.na(pm25), mean(pm25, na.rm = TRUE), pm25)) %>%
+#   ungroup()
+non_missing_df$pm25[non_missing_df$pm25 > 20] <- 20
+non_missing_df <- non_missing_df %>% 
+  mutate(median_income = scale(median_income)[, 1])
+summary(non_missing_df)
+``` 
+   
+### Impute count data for covariates and outcome, obtain final outcome
+
+First load count data and convert to wide format. Impute count for all categories, remove unknown or uninformative features later.
+```{r}
+age_count <- read.csv("data/ca_age_2018To2024.csv")
+race_count <- read.csv("data/ca_race_2018To2024.csv")
+edu_count <- read.csv("data/ca_education_2018To2024.csv")
+country_count <- read.csv("data/ca_country_2018To2024.csv")
+prenatal_count <- read.csv("data/ca_prenatal_2018To2024.csv")
+bw_count <- read.csv("data/ca_bw_count_2018To2024.csv")
+
+age_wide <- age_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    age_bin = Age,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  # filter(age_bin != "50 years and over/Unknown") %>% 
+  dplyr::select(zip, year, age_bin, total_births) %>%
+  pivot_wider(
+    names_from = age_bin,
+    values_from = total_births,
+    values_fill = NA
+  ) 
+
+race_wide <- race_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    race_bin = Race_Ethnicity,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  dplyr::select(zip, year, race_bin, total_births) %>%
+  pivot_wider(
+    names_from = race_bin,
+    values_from = total_births,
+    values_fill = NA
+  )
+
+edu_wide <- edu_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    edu_bin = Education_Level,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  dplyr::select(zip, year, edu_bin, total_births) %>%
+  pivot_wider(
+    names_from = edu_bin,
+    values_from = total_births,
+    values_fill = NA
+  )
+
+country_wide <- country_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    country_bin = US_or_Foreign_Born,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  dplyr::select(zip, year, country_bin, total_births) %>%
+  pivot_wider(
+    names_from = country_bin,
+    values_from = total_births,
+    values_fill = NA
+  )
+
+prenatal_wide <- prenatal_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    pre_bin = Trimester_Prenatal_Care_Began,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  dplyr::select(zip, year, pre_bin, total_births) %>%
+  pivot_wider(
+    names_from = pre_bin,
+    values_from = total_births,
+    values_fill = NA
+  )
+
+bw_wide <- bw_count %>%
+  filter(Year_of_Birth < 2025) %>%
+  mutate(
+    zip = ZIP_Code_of_Residence,
+    year = Year_of_Birth,
+    bw_bin = Birthweight_Grams,
+    total_births = as.numeric(Total_Births)
+  ) %>%
+  dplyr::select(zip, year, bw_bin, total_births) %>%
+  pivot_wider(
+    names_from = bw_bin,
+    values_from = total_births,
+    values_fill = NA
+  )
+```
+
+Impute count data.
+```{r}
+## helper that turns a “wide” count table into a numeric matrix
+to_impute_mat <- function(df_wide, index) {
+  df_wide %>%
+    right_join(index[,c("zip", "year", "total_birth")], by = c("zip", "year")) %>%   # forces same rows
+    arrange(zip, year) # %>%         # row order = index
+    # dplyr::select(-zip, -year)    # drop keys
+}
+
+Y_age <- to_impute_mat(age_wide, non_missing_df)
+age_cols <- colnames(Y_age)[!colnames(Y_age) %in% c("zip", "year", "total_birth")]
+Y_age_imputed <- impute_prop(df=Y_age, imp_cols=age_cols, N_col="total_birth") 
+Y_age_imputed[,age_cols] <- Y_age_imputed[,age_cols] / Y_age_imputed$total_birth
+
+Y_race <- to_impute_mat(race_wide, non_missing_df)
+race_cols <- colnames(Y_race)[!colnames(Y_race) %in% c("zip", "year", "total_birth")]
+Y_race_imputed <- impute_prop(df=Y_race, imp_cols=race_cols, N_col="total_birth") 
+Y_race_imputed[, race_cols] <- Y_race_imputed[, race_cols] / Y_race_imputed$total_birth
+
+Y_edu <- to_impute_mat(edu_wide, non_missing_df)
+edu_cols <- colnames(Y_edu)[!colnames(Y_edu) %in% c("zip", "year", "total_birth")]
+Y_edu_imputed <- impute_prop(df=Y_edu, imp_cols=edu_cols, N_col="total_birth") 
+Y_edu_imputed[, edu_cols] <- Y_edu_imputed[, edu_cols] / Y_edu_imputed$total_birth
+
+Y_country <- to_impute_mat(country_wide, non_missing_df)
+country_cols <- colnames(Y_country)[!colnames(Y_country) %in% c("zip", "year", "total_birth")]
+Y_country_imputed <- impute_prop(df=Y_country, imp_cols=country_cols, N_col="total_birth") 
+Y_country_imputed[, country_cols] <- Y_country_imputed[, country_cols] / Y_country_imputed$total_birth
+
+Y_prenatal <- to_impute_mat(prenatal_wide, non_missing_df)
+prenatal_cols <- colnames(Y_prenatal)[!colnames(Y_prenatal) %in% c("zip", "year", "total_birth")]
+Y_prenatal_imputed <- impute_prop(df=Y_prenatal, imp_cols=prenatal_cols, N_col="total_birth") 
+Y_prenatal_imputed[, prenatal_cols] <- Y_prenatal_imputed[, prenatal_cols] / Y_prenatal_imputed$total_birth
+
+Y_bw <- to_impute_mat(bw_wide, non_missing_df)
+bw_cols <- colnames(Y_bw)[!colnames(Y_bw) %in% c("zip", "year", "total_birth") ]
+# Y_bw_imputed <- 
+#   impute_prop(df=Y_bw, 
+#               imp_cols=bw_cols,  
+#               N_col="total_birth") 
+Y_bw_imputed <- impute_quasipoisson(Y_df = Y_bw,
+                                    X_df = non_missing_df, 
+                                    imp_cols = bw_cols,
+                                    N_col = "total_birth")
+
+# Y_bw_prop <- Y_bw[,bw_cols] / Y_bw$total_birth
+# X_base <- non_missing_df %>%             # predictors that are ALWAYS observed
+#   transmute(pm25, median_income, long, lat, year, intercept = 1) %>% 
+#   as.matrix()
+# X_bw    <- cbind(X_base, Y_age_imp / N,  Y_educ_imp / N,  Y_race_imp / N)
+
+bw_summary <- Y_bw_imputed %>%                
+  rowwise() %>%
+  mutate(stats = list(estimate_birthweight_stats(
+    birth_num = c_across(all_of(bw_cols[1:8])),
+    total_n   = total_birth,
+    method    = "normal"))) %>%     # or "normal"
+  unnest_wider(stats) %>%
+  ungroup() %>% 
+  dplyr::select(zip, year, bw_mean, bw_prop_low, bw_var, total_birth)
+head(as.matrix(bw_summary))
+```
+
+Plot mean birthweight distribution in 2019.
+```{r}
+zcta_shapes <- zctas(cb = TRUE, year = 2019)
+ca <- states(year = 2019) %>%
+  filter(STUSPS == "CA")
+ca <- st_transform(ca, st_crs(zcta_shapes))
+zcta_ca <- st_intersection(zcta_shapes, ca)
+zcta_ca <- zcta_ca %>%
+  rename(zip_code = ZCTA5CE10) %>%
+  mutate(zip_code = as.numeric(zip_code))
+
+zcta_ca_joined <- zcta_ca %>%
+  left_join(bw_summary[bw_summary$year==2019,], by = c("zip_code" = "zip"))
+
+p_bw <- ggplot(data = zcta_ca_joined) +
+  geom_sf(aes(fill = bw_mean), color = NA) +
+  # Use a continuous color scale (viridis) for PM2.5
+  scale_fill_viridis_c(
+    name = "Birthweight (g)",
+    na.value = "grey80",      # color for missing data
+    option = "magma",          # or "viridis", "plasma", etc.
+    direction = -1
+  ) +
+  # facet_wrap(~ Year_of_Birth, ncol = 4) +
+  labs(
+    title = "Average Birthweight by ZIP Code in California (2019)",
+    fill = "Birthweight (g)",
+    x = NULL,  # Often we drop lat/long axis labels for thematic maps
+    y = NULL
+  ) +
+  theme_minimal()
+p_bw
+# ggsave("ca_birthweight_2019.pdf", p_bw, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+Merge all the data.
+```{r}
+df_list <- list(non_missing_df, bw_summary, Y_age_imputed, Y_race_imputed, Y_edu_imputed,
+                Y_country_imputed, Y_prenatal_imputed)
+
+df_list_clean <- list(
+  df_list[[1]],                                # keep total_birth here
+  df_list[[2]] %>% dplyr::select(-total_birth),      
+  df_list[[3]] %>% dplyr::select(-total_birth),  
+  df_list[[4]] %>% dplyr::select(!c(total_birth, `Unknown or Not Stated`)),
+  df_list[[5]] %>% dplyr::select(!c(total_birth, `Unknown`)),
+  df_list[[6]] %>% dplyr::select(!c(total_birth, `Unknown`)),
+  df_list[[7]] %>% dplyr::select(!c(total_birth, `Unknown/Not Reported`))
+)
+
+merged_bw_df <- reduce(df_list_clean, inner_join, by = c("zip", "year"))
+head(merged_bw_df)
+```
+
+Drop collinear features.
+```{r}
+# print(vif(lm(bw_mean ~ ., data = merged_bw_df %>% dplyr::select(-zip, -year))))
+merged_bw_df_selected <- merged_bw_df %>% 
+  dplyr::select(-`35 - 39 years`,
+                -`Hispanic`, 
+                -`Bachelor's Degree`,
+                -`United States`)
+print(vif(lm(bw_mean ~ ., data = merged_bw_df_selected %>% dplyr::select(-zip, -year))))
+```
+
+```{r}
+# saveRDS(merged_bw_df_selected, file = "birthweight_data_preprocess.rds")
+# merged_bw_df_selected <- readRDS("birthweight_data_preprocess.rds")
+```
+
+## Partially linear model
+
+```{r}
+raw_names <- colnames(merged_bw_df_selected)[11:35]
+colnames(merged_bw_df_selected)[11:35] <- paste0("x", 1:25)
+formula <- as.formula(paste("bw_mean ~ pm25 + median_income + s(lat, long, k=200) + factor(year) + ",
+                            paste(colnames(merged_bw_df_selected)[11:35]  , collapse = " + ")))
+
+fit1 <- mgcv::gam(formula, data = merged_bw_df_selected) 
+get_gam_ci(fit1, "pm25")
+```
+
+Estimate for each year.
+```{r}
+formula1 <- as.formula(paste("bw_mean ~ pm25 + median_income + s(lat, long, k=200) + ", 
+                            paste(colnames(merged_bw_df_selected)[11:35]  , collapse = " + ")))
+years <- 2018:2024
+coefficients_pm25 <- sapply(years, function(y) {
+  fit <- mgcv::gam(formula1, data = merged_bw_df_selected[merged_bw_df_selected$year == y,])
+  fit$coefficients[2]
+})
+
+names(coefficients_pm25) <- years
+print(coefficients_pm25)
+```
+
+DML random forest.
+```{r}
+x <- merged_bw_df_selected[, c(2,4:5,7,11:35)]
+d <- merged_bw_df_selected[,]$pm25
+y <- merged_bw_df_selected[,]$bw_mean
+
+set.seed(202505)
 
 #DML with Random Forest:
 dreg <- function(x,d){randomForest(x, d)} 
 yreg <- function(x,y){randomForest(x, y)} 
 
-set.seed(111)
-dml_rf = dml_plm(x, d, y, dreg, yreg, nfold=10)
-resY =  dml_rf$ytil
-resD =  dml_rf$dtil
+dml_rf = dml_plm(x, d, y, dreg, yreg, nfold=5)
+resD <- dml_rf$resD
+resY <- dml_rf$resY
 
-print(c("Controls explain the following fraction of variance of Outcome", 
-        max(1 - var(resY)/var(y), 0)))
-print(c("Controls explain the following fraction of variance of Treatment",
-        max(1 - var(resD)/var(d), 0)))
-
-res_model <- lm(resY ~ resD) 
-dml_sensitivity <- sensemakr(model = res_model, treatment = "resD")
-summary(dml_sensitivity)
-plot(dml_sensitivity, nlevels = 15)
-```
-The causal effect estimate is not statistically significant even without unoberved confounders.
-
-## Individual-level modeling
-
-DML 
-```{r}
-# speed up, parallel
-samples <- sample(1:nrow(bw_individual), nrow(bw_individual)/10)
-x <- bw_individual[samples, 6:29]
-d <- bw_individual$pm25_pred_avg[samples]
-y <- bw_individual$samples[samples]
-
-#DML with Random Forest:
-dreg <- function(x,d){randomForest(x, d)} 
-yreg <- function(x,y){randomForest(x, y)} 
-
-set.seed(111)
-dml_rf_ind = dml_plm(x, d, y, dreg, yreg, nfold=4)
-resY_ind =  dml_rf_ind$ytil
-resD_ind =  dml_rf_ind$dtil
-
-print(c("Controls explain the following fraction of variance of Outcome", 
-        max(1 - var(resY_ind)/var(y), 0)))
-print(c("Controls explain the following fraction of variance of Treatment",
-        max(1 - var(resD_ind)/var(d), 0)))
-
-res_model_ind <- lm(resY_ind ~ resD_ind) 
-dml_sensitivity_ind <- sensemakr(model = res_model_ind, treatment = "resD_ind")
-summary(dml_sensitivity_ind)
-plot(dml_sensitivity_ind, nlevels = 15)
+print(dml_rf$coef.est) # -0.23
+z_alpha <- 1.96  # For 95% CI
+dml_lower <- dml_rf$coef.est - z_alpha * dml_rf$se
+print(dml_lower)
+dml_upper <- dml_rf$coef.est + z_alpha * dml_rf$se
+print(dml_upper)
 ```
 
-
-Fit INLA without covariates.
-
+Factor model over space.
 ```{r}
-samples <- sample(1:nrow(bw_individual), nrow(bw_individual)/10)
-# s <- as.matrix(bw_individual[samples, 6:7])
-s <- as.matrix(bw_zipcode[,6:7])
-t <- bw_zipcode$pm25_pred_avg
-y <- bw_individual$samples[samples]
+resY_mat <- t(matrix(resY, nrow=7))
+eigen(cov(resY_mat))$values
 
-tibble(f = t, s1 = s[,1], s2 = s[,2]) %>%
-  ggplot(aes(x=s1, y=s2, color=f)) +
+resD_mat <- t(matrix(resD, nrow=7))
+eigen(cov(resD_mat))$values
+
+sm_factor <- cmdstanr::cmdstan_model("stan/time_nc_factor.stan")
+data_list <- list(K=ncol(resD_mat), Q=ncol(resD_mat), N=nrow(resD_mat), M=3, d=resD_mat, y=resY_mat) 
+
+n_draws <- 2000
+vb_result <- sm_factor$variational(data = data_list, seed = 123, draws = n_draws)
+vb_result$print(c("beta", "sigma_d", "sigma_y")) # constant variance for D and Y?
+draws_factor <- vb_result %>% spread_draws(beta, sigma_d, sigma_y)
+draws_factor$lower1 <- draws_factor$beta - draws_factor$sigma_y / draws_factor$sigma_d * 
+  sqrt(etaY2 * etaD2 / (1 - etaD2))
+
+posterior::summarise_draws(draws_factor, mean, ~quantile(.x, probs = c(0.025, 0.975)))
+```
+
+Factor model over time.
+```{r}
+resY_mat_time <- matrix(resY, nrow=7)
+# eigen(cov(resY_mat_time))$values
+
+resD_mat_time <- matrix(resD, nrow=7)
+# eigen(cov(resD_mat_time))$values
+data_list_time <- list(K=ncol(resD_mat_time), Q=ncol(resD_mat_time), N=nrow(resD_mat_time),
+                       M=1, d=resD_mat_time, y=resY_mat_time) 
+
+n_draws <- 1000
+vb_result_time <- sm_factor$variational(data = data_list_time, seed = 123, draws = n_draws)
+vb_result_time$print(c("beta", "sigma_d", "sigma_y")) 
+draws_time <- vb_result_time$draws("beta")
+posterior::summarise_draws(draws_time, mean, ~quantile(.x, probs = c(0.025, 0.975)))
+```
+
+
+Assume S affect D and Y only through U.
+```{r}
+# remove covariates
+x_s <- merged_bw_df_selected[, c(2,7,11:35)]
+d <- merged_bw_df_selected[,]$pm25
+y <- merged_bw_df_selected[,]$bw_mean
+
+set.seed(2026)
+# dml_rf_s = dml_plm(x_s, d, y, dreg, yreg, nfold=5)
+
+dml_linear_s <- dml_plr_gam(
+  df       = merged_bw_df_selected,
+  y        = "bw_mean",
+  d        = "pm25",
+  x_spline = c("median_income"), # "lat", "long", "year"
+  x_other  = colnames(merged_bw_df_selected)[c(2,11:35)],
+  K        = 5,
+  k_spline = 3
+)
+resD_s <- dml_linear_s$residuals$D
+resY_s <- dml_linear_s$residuals$Y
+
+# sm_gp <- cmdstanr::cmdstan_model("stan/partial_gp.stan") 
+# data_list_gp <- list(D=2, N=length(resY_s), s=as.matrix(merged_bw_df_selected[, c("long", "lat")]), 
+#                      t=resD_s, y=resY_s)
+# fit_gp_vb <- sm_gp$variational(
+#   data = data_list_gp,
+#   seed = 123,
+#   draws = 1000
+# )
+# fit_gp_vb$print(c("b_t", "sigma_t", "sigma_y"))
+
+resD_s_mat <- matrix(resD_s, nrow=7)
+resY_s_mat <- matrix(resY_s, nrow=7)
+
+M <- 120
+s <- as.matrix(merged_bw_df_selected[merged_bw_df_selected$year==2018, c("long", "lat")])
+km <- kmeans(s, centers = M, nstart = 20)
+s0  <- km$centers  
+# resY_s <- matrix(merged_bw_df_selected$bw_mean, nrow=7)
+# resD_s <- matrix(merged_bw_df_selected$pm25, nrow=7)
+# X_array <- array(x_s, dim = c(7, N, ncol(x_s)))
+
+sm1 <- cmdstanr::cmdstan_model("stan/linear_onlyU_bw.stan")
+data_list_s <- list(D=2, N=ncol(resY_s_mat), T0=nrow(resY_s_mat), M=M,
+                    s=s, s0=s0, d=resD_s_mat, y=resY_s_mat)
+fit_s_vb <- sm1$variational(
+  data = data_list_s,
+  seed = 123,
+  draws = 1000
+)
+fit_s_vb$print(c("a", "b"))
+draws_s <- fit_s_vb %>% spread_draws(a, b)
+# mcmc_trace(draws_s, pars = c("a", "b"))
+draws_s["0.05"] <- draws_s$a - draws_s$b*6 / (1 - 0.05) * 0.05
+draws_s["0.03"] <- draws_s$a - draws_s$b*6 / (1 - 0.03) * 0.03
+posterior::summarise_draws(draws_s, mean, ~quantile(.x, probs = c(0.025, 0.975)))
+```
+
+Benchmark sensitivity parameters.
+```{r}
+# merged_bw_df_selected[, c(2,4:5,7,20:35)]
+dml_rf_bench = dml_plm(merged_bw_df_selected[,c(2,4:5,11:35)], d, y, dreg, yreg, nfold=5)
+R2D_wo <- 1 - var(dml_rf_bench$resD) / var(d)
+R2Y_wo <- 1 - var(dml_rf_bench$resY) / var(y)
+R2D_full <- 1 - var(dml_rf$resD) / var(d)
+R2Y_full <- 1 - var(dml_rf$resY) / var(y)
+print((R2D_full - R2D_wo) / (1 - R2D_full))
+print((R2Y_full - R2Y_wo) / (1 - R2Y_full))
+
+# dml_rf_bench1 = dml_plm(merged_bw_df_selected[,c(2,4:5,7,11:19,27:35)], d, y, dreg, yreg, nfold=3)
+# R2D_wo1 <- 1 - var(dml_rf_bench1$resD) / var(d)
+# R2Y_wo1 <- 1 - var(dml_rf_bench1$resY) / var(y)
+# print((R2D_full - R2D_wo1) / (1 - R2D_full))
+# print((R2Y_full - R2Y_wo1) / (1 - R2Y_full))
+# 
+# dml_rf_bench2 = dml_plm(merged_bw_df_selected[,c(2,4:5,7,11:26,31:35)], d, y, dreg, yreg, nfold=5)
+# R2D_wo2 <- 1 - var(dml_rf_bench2$resD) / var(d)
+# R2Y_wo2 <- 1 - var(dml_rf_bench2$resY) / var(y)
+# print((R2D_full - R2D_wo2) / (1 - R2D_full))
+# print((R2Y_full - R2Y_wo2) / (1 - R2Y_full))
+# 
+# dml_rf_bench3 = dml_plm(merged_bw_df_selected[,c(2,4:5,7,11:31)], d, y, dreg, yreg, nfold=5)
+# R2D_wo3 <- 1 - var(dml_rf_bench3$resD) / var(d)
+# R2Y_wo3 <- 1 - var(dml_rf_bench3$resY) / var(y)
+# print((R2D_full - R2D_wo3) / (1 - R2D_full))
+# print((R2Y_full - R2Y_wo3) / (1 - R2Y_full))
+```
+Benchmark: income explains the most R2D <= 0.07, race explains the most R2Y <= 0.05.
+
+Plot the results
+```{r}
+etaD2 = 0.05
+etaY2 = 0.05
+
+two_lower1 <- dml_lower - 51 / 1.1 * 
+  sqrt(etaY2 * etaD2 / (1 - etaD2))
+two_upper1 <- dml_upper + 51 / 1.1 * 
+  sqrt(etaY2 * etaD2 / (1 - etaD2))
+two_lower2 <- dml_lower - 51 / 1.1 * 
+  sqrt(0.02 * 0.02 / (1 - 0.02))
+two_upper2 <- dml_upper + 51 / 1.1 * 
+  sqrt(0.02 * 0.02 / (1 - 0.02))
+# -1.4594935 - 49.6/1.04* sqrt(0.05 * 0.05 / (1 - 0.05))
+
+effects <- tibble(
+  method = c("Partially linear model", "Random forest DML", "Factor confounding over space", "Factor confounding over time", "Space only affects U"),
+  est = c(-0.4674671*10, dml_rf$coef.est*10, -1.594405*10, -1.18*10, -1.300056*10),  # Naïve DML estimate
+  # 95% CI
+  lower = c(-1.4594935*10, dml_lower*10, -2.5079965*10, -2.13*10, -1.8103245*10),  # Lower bounds
+  upper = c(0.5245592*10, dml_upper*10, -0.6327763*10, -0.172*10, -0.7529676*10),  # Upper bounds
+  ## wider “ignorance” region after adding the sensitivity parameter
+  ign_lo_1 = c(-3.906057*10, two_lower1*10, -6.140277*10, -5.410597*10, -1.9160571*10),
+  ign_hi_1 = c(2.971064*10, two_upper1*10, 2.99277*10, 3.108597*10, NA),
+  ign_lo_2 = c(-2.423024*10, two_lower2*10, -3.938*10, -3.421997*10, -1.8740267*10),
+  ign_hi_2 = c(1.49302*10, two_upper2*10, 0.7950725*10, 1.119997*10, NA)
+) %>% 
+  mutate(method = factor(method, levels = rev(method)))
+
+sens_points <- bind_rows(
+  effects %>%
+    dplyr::select(method, sens = ign_lo_1) %>%
+    mutate(type = "Sensitivity bounds (η² = 0.05)"),
+  effects %>%
+    dplyr::select(method, sens = ign_hi_1) %>%
+    mutate(type = "Sensitivity bounds (η² = 0.05)"),
+  effects %>%
+    dplyr::select(method, sens = ign_lo_2) %>%
+    mutate(type = "Sensitivity bounds (η² = 0.02)"),
+  effects %>%
+    dplyr::select(method, sens = ign_hi_2) %>%
+    mutate(type = "Sensitivity bounds (η² = 0.02)")
+)
+
+## Plot 
+p_regions <- ggplot(effects, aes(y = method)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  # main 95% interval
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = .15, size = 1) +
+  # point estimate
+  geom_point(aes(x = est), size = 1.5) +
+  # ignorance bounds as coloured triangles
+  geom_point(data = sens_points,
+             aes(x = sens, colour = type),
+             shape = 17, size = 2,
+             position = position_nudge(x = .15)) +
+  scale_colour_manual(values = c("Sensitivity bounds (η² = 0.05)" = "#E69F00",
+                                 "Sensitivity bounds (η² = 0.02)" = "#009E73"),
+                      labels = c(expression(paste("Sensitivity bounds (", eta^2, " = 0.02)")),
+                                 expression(paste("Sensitivity bounds (", eta^2, " = 0.05)")))) +
+  guides(colour = guide_legend(override.aes = list(size = 4))) +
+  labs(x = "Birthweight change (g) per 10 µg/m³ PM2.5",
+       y = NULL,
+       colour = NULL,
+       title = "Estimated Treatment Effects with Sensitivity Bounds") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_regions
+# ggsave("bw_ignorance_regions.pdf", p_regions, width = 7, height = 5, units = "in", dpi = 300)
+```
+
+
+## Omit some observed covariates 
+
+Check which covariates do not change over time, then omit them as time-invariant confounders.
+```{r}
+merged_bw_df_selected %>%
+  ggplot(aes(x = year, y = x24, group = zip)) +
+  geom_line(alpha = 0.5, color = "gray") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", color = "red", size = 1) +
+  labs(
+    title = "Covariate Trends Across ZIP Codes (Gray) and Statewide Mean (Red)",
+    x = "Year",
+    y = "X"
+  ) +
+  theme_minimal()
+```
+
+Check if covariates are spatially smooth.
+```{r}
+u_s <- tibble(t = merged_bw_df_selected$x10, s1 = merged_bw_df_selected$long, s2 = merged_bw_df_selected$lat)
+u_s %>%
+  ggplot(aes(x=s1, y=s2, color=t)) + 
   geom_point(alpha=1, size=2.5) +
-  theme_bw()
-
-mesh1 <- fm_mesh_2d_inla(loc=s, max.edge=c(0.4, 1.2), cutoff=0.2, offset=c(0.5,2))
-plot(mesh1)
-points(s, pch=3, bg=1, col="red", cex=1)
-
-A.est <- inla.spde.make.A(mesh=mesh1, loc=s)
-print(dim(A.est)) # number of data locations * number of mesh nodes
-
-# fit model
-spde <- inla.spde2.matern(mesh=mesh1, alpha=2) 
-formula <- y ~ -1 + intercept + f(spatial.field, model=spde)
-# spatial.field is a index variable?
-result <- inla(formula, 
-               data = list(y=t, intercept=rep(1, spde$n.spde),
-               spatial.field=1:spde$n.spde),
-               control.predictor=list(A=A.est, compute=TRUE))
-
-# round(result$summary.fixed, 3)
-print(round(result$summary.hyperpar, 3))
-cat("posterior mean of sigma_t_tilde_sq =", inla.emarginal(function(x) 1/x, result$marginals.hyper[[1]])) # posterior mean of variance
+  theme_bw() + scale_color_continuous_sequential(palette = "Blues")
 ```
-Posterior mean $\tilde{\sigma}_T^2$ is around $1.3$.
-
 
 ```{r}
-t <- bw_individual$pm25_pred_avg[samples]
-mesh <- fm_mesh_2d_inla(loc=s, max.edge=c(0.25, 1), offset=c(0.5,2))
-plot(mesh)
-points(s, pch=3, bg=1, col="red", cex=1)
+run_analysis <- function(data,
+                         adj_cols = character(0L),   # adjustment set X
+                         d_col     = "pm25",          # treatment   column
+                         y_col     = "bw_mean",       # outcome     column
+                         unit_col  = "unit",          # ID for interFE
+                         time_col  = "time",          # ID for interFE
+                         T_periods = 7L,              # # of time points
+                         M_factors = 3L,              # # of latent factors in Stan
+                         nfold     = 5L,
+                         vb_draws  = 2000L,
+                         seed      = 123) {
 
-# For each observation, index gives the corresponding index into the matrix of measurement locations, and repl determines the corresponding replicate index. 
-A <- inla.spde.make.A(mesh, loc = s, 
-                      index = match(bw_individual[samples,]$zip, bw_zipcode$zip))
-print(dim(A))
-spde <- inla.spde2.matern(mesh=mesh, alpha=2) 
+  ## 1.1 Split variables -------------------------------------------
+  X <- if (length(adj_cols)) data[, adj_cols, drop = FALSE] else NULL
+  d <- data[[d_col]]
+  y <- data[[y_col]]
 
-# index the full mesh and replicates
-mesh.index <- inla.spde.make.index(name = "field", n.spde = spde$n.spde)
+  ## 1.2 DML --------------------------------------------------------
+  set.seed(seed)
+  dml_fit <- dml_plm(X, d, y, dreg, yreg, nfold = nfold)
 
-# stack the predictor information
-stack <- inla.stack(data = list(y = y), A = list(A, 1),
-                    effects = list(c(mesh.index, list(intercept = 1)),
-                                   list(cov = t, loc = samples)), tag = "est")
+  coef_hat <- as.numeric(dml_fit$coef.est)
+  se_hat   <- as.numeric(dml_fit$se)
+  ci_95    <- coef_hat + c(-1.96, 1.96) * se_hat
 
-# fit model
-formula <- y ~ -1 + intercept + cov + f(field, model = spde, replicate = field.repl) + f(loc, model = "iid")
-rep_result <- inla(formula, data = inla.stack.data(stack, spde = spde),
-                   family = "normal",
-                   control.predictor = list(A = inla.stack.A(stack),
-                                             compute = TRUE))
-print(round(rep_result$summary.fixed, 3))
-print(round(rep_result$summary.hyperpar, 3))
-cat("posterior mean of sigma_y_tilde_sq - sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[4]]), '\n')
-cat("posterior mean of sigma_y_sq =", inla.emarginal(function(x) 1/x, rep_result$marginals.hyper[[1]])) 
+  ## 1.3  Residuals to matrices -------------------------------------
+  resD_mat <- matrix(dml_fit$d_til, ncol = T_periods, byrow = TRUE)
+  resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
 
-posterior_beta_tilde <- rep_result$marginals.fixed[[2]]
-plot(posterior_beta_tilde, type = "l", xlab = 'beta_t_tilde', ylab = 'density',
-     main = "Posterior density of beta_t_tilde")
+  ## 1.4  Stan (Factor model VB) ------------------------------------
+  N_units <- nrow(resD_mat)
+  stan_data <- list(
+    K = T_periods, Q = T_periods, N = N_units,
+    M = M_factors, d = resD_mat,  y = resY_mat
+  )
+  sm_factor <- cmdstanr::cmdstan_model("stan/time_nc_factor.stan")
+  vb_fit <- sm_factor$variational(data = stan_data, seed = seed, draws = vb_draws)
+  vb_sum <- posterior::summarise_draws(
+              vb_fit$draws("beta"),
+              mean,
+              ~quantile(.x, probs = c(0.025, 0.975))
+            )
 
-posterior_sigma_y_sq <- rep_result$marginals.hyperpar[[1]]
-posterior_sigma_y_sq[,1] <- 1 / posterior_sigma_y_sq[,1]
-plot(posterior_sigma_y_sq, type = "l", xlab = 'sigma_y_sq', ylab = 'density',
-     main = "Posterior density of sigma_y_sq")
+  ## 1.5  interFE ---------------------------------------------------
+  df_fe <- data.frame(
+            unit = rep(1:N_units, each = T_periods), # unit
+            time = rep(1:T_periods, N_units),
+            Y    = dml_fit$resY,
+            D    = dml_fit$d_til
+          )
+  # flip time and unit does not change much
+  fe_fit <- interFE(Y ~ D, data = df_fe,
+                    index = c("unit", "time"),
+                    r     = M_factors,
+                    force = "none",
+                    nboots = 300)
 
-posterior_sigma_y_tilde_sq <- rep_result$marginals.hyperpar[[4]]
-posterior_sigma_y_tilde_sq[,1] <- 1 / posterior_sigma_y_tilde_sq[,1] +
-  posterior_sigma_y_sq[,1]
-plot(posterior_sigma_y_tilde_sq, type = "l", xlab = 'sigma_y_tilde_sq', ylab = 'density',
-     main = "Posterior density of sigma_y_tilde_sq")
+  ## 1.6  Return --------------------------------------------
+  list(
+    adj_set     = adj_cols,
+    dml_coef    = coef_hat,
+    dml_ci_95   = ci_95,
+    vb_summary  = vb_sum,
+    interFE_est = fe_fit$beta
+  )
+}
+```
+
+```{r}
+ev <- eigen(cor(resD_mat))  # X should be standardized
+nScreeObj <- nScree(x = ev$values)
+plotnScree(nScreeObj)
+nScreeObj$Components   
+```
+
+```{r}
+results_raw <- run_analysis(merged_bw_df_selected)
+results_T <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[c(2,7)])
+results_S <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[4:5], seed = 111)
+results_X <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[11:35])
+results_ST <- run_analysis(merged_bw_df_selected, 
+                           adj_cols = colnames(merged_bw_df_selected)[c(2,4:5,7)])
+results_XT <- run_analysis(merged_bw_df_selected, 
+                           adj_cols = colnames(merged_bw_df_selected)[c(2,7,11:35)])
+results_XS <- run_analysis(merged_bw_df_selected, 
+                           adj_cols = colnames(merged_bw_df_selected)[c(4:5,11:35)])
+results_all <- run_analysis(merged_bw_df_selected, 
+                            adj_cols= colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)])
 ```
 
 
+plot the estimate of omitting some covariates:
+```{r}
+omit_df <- tribble(
+  ~setting,                       ~model,               ~estimate, ~lwr, ~upr,
+  "No Adjustment",                "Naïve DML",          -47.72,   -53.32, -42.12,
+  "No Adjustment",                "IFE",                -8.78,    -35.17,  15.99,
+  "No Adjustment",                "Factor Confounding", -9.284,   -13.7,   -4.67, 
+  "Spatial Only",                 "Naïve DML",           4.34,    -3.36,   12.04,
+  "Spatial Only",                 "IFE",                 -15.30,  -37.87,  7.274,
+  "Spatial Only",                 "Factor Confounding", -8.498,   -15.16, -1.488,  
+  "Time-Varying Only",            "Naïve DML",          -56.76,   -62.86, -50.659,
+  "Time-Varying Only",            "IFE",                 1.273,   -19.28, 15.51, 
+  "Time-Varying Only",            "Factor Confounding", -12.624,  -18.3, -6.7,
+  "Static Only",                  "Naïve DML",          -7.4,     -13.356, -1.443,
+  "Static Only",                  "IFE",                -7.531,   -30.38, 8.883,
+  "Static Only",                  "Factor Confounding", -10.20,   -15.567, -4.553,
+  "Time-Varying + Spatial",       "Naïve DML",          -24.45,   -36.01, -12.89,
+  "Time-Varying + Spatial",       "IFE",                -7.92,    -35.9,   21.94,
+  "Time-Varying + Spatial",       "Factor Confounding", -18.88,   -30.68, -6.32,
+  "Time-Varying + Spatial",       "Double NC",         -37.666,   -87.32, 1.199,
+  "Spatial + Static",             "Naïve DML",          -3.44,    -10.96,  4.083,
+  "Spatial + Static",             "IFE",                -19.97,   -31.75,  9.74,
+  "Spatial + Static",             "Factor Confounding", -8.75,    -15.6,  -1.52,
+  "Spatial + Static",             "Double NC",         -25.10,    -65.71,  15.514,
+  "Time-Varying + Static",        "Naïve DML",          -12.08,  -18.85,   -5.3,
+  "Time-Varying + Static",        "IFE",                -6.20,   -28.62,    8.57,
+  "Time-Varying + Static",        "Factor Confounding", -14.78,   -21.1, -8.08,
+  "All Confounders",              "Naïve DML",          -11.98,   -21.96, -1.995,
+  "All Confounders",              "IFE",                -7.5,     -40.81, 16.35,
+  "All Confounders",              "Factor Confounding", -15.94,   -25.08, -6.33,
+  "All Confounders",              "Double NC",         -18.39,   -54.41, 17.62
+)
 
+# Preserve the logical order on the x‑axis
+omit_df$setting <- factor(omit_df$setting,
+  levels = c(
+    "No Adjustment",
+    "Spatial Only",
+    "Time-Varying Only",
+    "Static Only",
+    "Time-Varying + Spatial",
+    "Spatial + Static",
+    "Time-Varying + Static",
+    "All Confounders")
+)
+omit_df$model <- factor(omit_df$model, levels = c("Naïve DML", "Factor Confounding", "IFE", "Double NC"))
 
+# Plot: point estimate + 95% CI, one colour per model
+p_omit <- ggplot(omit_df,
+       aes(x = setting,
+           y = estimate,
+           colour = model #,shape  = model
+           )) +
+  geom_point(position = position_dodge(width = .35),
+             size = 2) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr),
+                width = .15,
+                position = position_dodge(width = .35),
+                linewidth = .8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Estimates Under Different Confounder Adjustments",
+       x = NULL,
+       y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase",
+       colour = NULL, shape = NULL) +
+  scale_colour_manual(values = c("Naïve DML" = "#0072B2",
+                                 "Factor Confounding" = "firebrick",
+                                 "IFE" = "#009E73",
+                                 "Double NC" = "#D55E00")) +
+  # scale_shape_manual(values = c("DML naïve"          = 16,   # filled circle
+  #                               "Factor confounding" = 17)) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 0.9),
+        panel.grid.minor = element_blank()
+        )
+p_omit
+# ggsave("bw_vary_adjustments_1.pdf", p_omit, width = 6.5, height = 5, units = "in", dpi = 300)
+```
+
+## Double negative control
+
+```{r}
+library(fixest)
+library(gmm)
+```
+
+Use outcome in previous year and exposure in next year as negative controls.
+```{r}
+bw_panel <- merged_bw_df_selected %>% 
+  arrange(zip, year) %>%     # make time increasing within ZIP
+  group_by(zip) %>% 
+  mutate(
+    ## negative controls
+    bw_lag1     = lag(bw_mean, 1),   #  W_i   = Y_{i-1}
+    pm25_lead1  = lead(pm25, 1),     #  Z_i   = X_{i+1}
+    # ln_income   = log(median_income + 1),   # scale-robust
+    year_fe     = factor(year)              # year as factor
+  ) %>% 
+  ungroup() %>% 
+  drop_na(bw_lag1, pm25_lead1)        # first & last year of each ZIP lose 1 row
+```
+
+```{r}
+rhs   <- paste(c("pm25", covars), collapse = " + ")
+fml   <- as.formula(
+  paste0("bw_mean ~ ", rhs, " | zip + year_fe")
+)
+
+ols_fe <- feols(fml, data = bw_panel, se = "cluster")
+# ols_fe <- feols(
+#   bw_mean ~ pm25 + median_income + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15 + x16 + x17 + x18 + x19 + x20 + x21 + x22 + x23 + x24 + x25 | zip + year_fe,
+#   data = bw_panel,
+#   se = "cluster"
+# )
+# etable(ols_fe, se.below = TRUE)
+coeftable(ols_fe)[c("pm25"), ]
+```
+
+```{r}
+nc_test <- feols(
+  bw_lag1 ~ pm25 + pm25_lead1 + median_income + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15 + x16 + x17 + x18 + x19 + x20 + x21 + x22 + x23 + x24 + x25 | zip + year_fe,
+  data = bw_panel,
+  se   = "cluster"
+)
+coeftable(nc_test)[c("pm25","pm25_lead1"), ]
+```
+
+```{r}
+# remove location and time fixed effect
+bw_panel_w <- bw_panel %>% 
+  group_by(zip) %>% 
+  mutate(across(c(bw_mean, pm25, bw_lag1, pm25_lead1, median_income, x1:x25), 
+                ~ .x - mean(.x, na.rm = TRUE))) %>%
+  ungroup() %>% 
+  group_by(year_fe) %>%     
+  mutate(across(c(bw_mean, pm25, bw_lag1, pm25_lead1, median_income, x1:x25), 
+                ~ .x - mean(.x, na.rm = TRUE))) %>%
+  ungroup()
+
+covars <- c("median_income")  #, paste0("x", 1:25)
+
+make_mom <- function(theta, d) {
+  kV      <- length(covars)          # 25 in your data
+  beta1   <- theta[kV + 3]           # last element of theta
+
+  ## theta layout:
+  ##   [1]     γ0
+  ##   [2]     γ2  (coefficient on W)
+  ##   [3:(kV+2)] γ_V (25 covariate terms)
+  ##   [kV+3] β1  (== γ1, coefficient on X)
+
+  gamma_vec <- c(
+    theta[1],        # γ0
+    beta1,           # γ1  (== β1)
+    theta[2:(kV+2)]  # γ2 and γ_V
+  )
+
+  X  <- d$pm25
+  W  <- d$bw_lag1
+  V  <- as.matrix(d[, covars])
+  Z  <- d$pm25_lead1
+  Y <- d$bw_mean
+
+  Bmat <- cbind(1, X, W, V)          # n × (kV+3)
+  Qmat <- cbind(1, X, Z, V)          # n × (kV+3)
+
+  resid <- Y - drop(Bmat %*% gamma_vec) # n-vector
+  m <- resid * Qmat 
+  m                        # n × (3+kV)
+}
+
+theta0 <- rep(0, 2 + length(covars) + 1)   # γ0 γ2 γ_V … β1
+names(theta0) <- c(
+  "gamma0",
+  "gamma2",
+  paste0("gamma_", covars),
+  "beta1"
+)
+gmm_fit <- gmm(
+  g        = make_mom,
+  x        = bw_panel, # bw_panel_w
+  t0       = theta0,
+  type     = "twoStep",
+  vcov     = "HAC",      # now safe: every column has variance
+  prewhite = FALSE
+)
+
+beta_tab <- summary(gmm_fit)$coefficients["beta1", ]
+beta_tab
+beta_hat <- beta_tab["Estimate"]
+se_hat   <- beta_tab["Std. Error"]
+ci_95    <- beta_hat + qnorm(c(.025, .975)) * se_hat
+ci_95
+```
 

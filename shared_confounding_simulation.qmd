@@ -1,0 +1,1384 @@
+---
+title: "Shared confounding Simulation"
+format: html
+editor: visual
+---
+
+```{r}
+library(cmdstanr)
+library(tidyverse)
+library(mgcv)
+library(randomForest) 
+# library(AER)
+library(fields)
+library(MASS)
+library(pci2s)
+library(gsynth)
+
+library(rstiefel)
+# library(psych)    # ML factor analysis (or: factanal)
+library(expm)     # for sqrtm
+library(scales)
+
+source("utilities.R")
+options(mc.cores=parallel::detectCores())
+
+dreg <- function(x,d){randomForest(x, d)} 
+yreg <- function(x,y){randomForest(x, y)}
+```
+
+## Spatially invariant confounding
+
+```{r}
+fit_spatial_invariant <- function(model, s, d, y, m, cache = NULL) {
+  n <- nrow(s); t <- nrow(d)
+
+  switch(model,
+         single_gp = {
+           d1 <- as.vector(d[1,])
+           y1 <- as.vector(y[1,])
+           data_list <- list(D=ncol(s), N=n, s=s, t=d1, y=y1)
+           gp_stan <- cmdstanr::cmdstan_model("stan/outcome_gp.stan")
+           single_gp_mle <- gp_stan$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(single_gp_mle$mle("beta"))
+         },
+
+         single_dml = {
+           dml_rf <- dml_plm(s, d[1,], y[1,], dreg, yreg, nfold=5)
+           res_model <- lm(dml_rf$resY ~ dml_rf$resD)
+           return(coef(res_model)[2])
+           # dml_rf$coef.est
+         },
+         
+         single_splines = {
+           s1 <- s[, 1]
+           s2 <- s[, 2]
+           plm_model <- mgcv::gam(y[1,] ~ d[1,] + s(s1, s2, k=min(n, 200)))
+           return(coef(plm_model)[2])
+         },
+         
+         multi_lm = {
+           lm_model <- lm(y ~ d)
+           return(coef(lm_model)[2, 1])
+         },
+
+         multi_spline = {
+           s1 <- rep(s[, 1], each = t)
+           s2 <- rep(s[, 2], each = t)
+           d_res <- matrix(residuals(mgcv::gam(as.vector(d) ~ s(s1, s2, k=min(n, 200)))), nrow=t)
+           y_res <- matrix(residuals(mgcv::gam(as.vector(y) ~ s(s1, s2, k=min(n, 200)))), nrow=t)
+           lm_model <- lm(y_res ~ d_res)
+           return(coef(lm_model)[2, 1])
+         },
+         
+         multi_dml = {
+           resY <- matrix(cache$resY, nrow=t)
+           resD <- matrix(cache$resD, nrow=t)
+           lm_model <- lm(resY ~ resD)
+           return(coef(lm_model)[2, 1])
+         },
+         
+         stack_gp = {
+           sm_nc_gp <- cmdstanr::cmdstan_model("stan/multi_nc_partial_gp.stan")
+           data_list <- list(D=ncol(s), N=n, T0=t, s=s, d=d, y=y)
+           opt_nc_gp <- sm_nc_gp$optimize(data=data_list, init=2, iter=1000, show_messages = FALSE)
+           return(opt_nc_gp$mle("beta"))
+         },
+         
+         stack_dml = {
+           lm_model <- lm(cache$resY ~ cache$resD)
+           return(coef(lm_model)[2])
+         },
+
+         stack_spline = {
+           s1 <- rep(s[, 1], each = t)
+           s2 <- rep(s[, 2], each = t)
+           plm_model <- mgcv::gam(as.vector(y) ~ as.vector(d) + s(s1, s2, k=min(n, 200)))
+           return(coef(plm_model)[2])
+         },
+
+         nc_mfactor = {
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=n, Q=n, N=t, M=m, d=d, y=y)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+
+         nc_2mfactor = {
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=n, Q=n, N=t, M=m*2, d=d, y=y)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+ 
+         spline_mfactor = {
+           s1 <- rep(s[, 1], each = t)
+           s2 <- rep(s[, 2], each = t)
+           # time = rep(1:t, times = n)
+           d_res <- matrix(residuals(mgcv::gam(as.vector(d) ~ s(s1, s2, k=min(n, 200)))), nrow=t)
+           y_res <- matrix(residuals(mgcv::gam(as.vector(y) ~ s(s1, s2, k=min(n, 200)))), nrow=t)
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=n, Q=n, N=t, M=m, d=d_res, y=y_res)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+
+         dml_mfactor = {
+           resY <- matrix(cache$resY, nrow=t)
+           resD <- matrix(cache$resD, nrow=t)
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=n, Q=n, N=t, M=m, d=resD, y=resY)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+         
+         ife = {
+           df <- data.frame(unit = rep(1:n, each = t),
+                            time = rep(1:t,  n),
+                            Y = c(y),
+                            D = c(d))
+           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m*2,
+                         force = "none", se = FALSE)
+           # ife_res <- ife_bai(y, d, 3)
+           return(gs$beta)
+         },
+         
+         dml_ife = {
+           df <- data.frame(unit = rep(1:n, each = t),
+                            time = rep(1:t,  n),
+                            Y = c(cache$resY),
+                            D = c(cache$resD))
+           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m,
+                         force = "none", se = FALSE)
+           # ife_res <- ife_bai(y, d, 3)
+           return(gs$beta)
+         },
+         
+         proximal_dnc = {                 
+           resY <- matrix(cache$resY, nrow = t)   # T × n
+           resD <- matrix(cache$resD, nrow = t)
+        
+           if (n < m + 1)
+             stop("Need at least m+1 units to supply ", m, " NC pairs")
+        
+           W <- resY[, 2]   # negative-control outcomes
+           Z <- resD[, 3]   # negative-control exposure
+           Y <- resY[, 1]   # focal outcome
+           A <- resD[, 1]   # focal exposure
+
+           p2sls_result <- p2sls.lm(
+             Y = Y,
+             A = A,
+             X = NULL,
+             W = W,
+             Z = Z,
+             nco_type = "linear",
+             nco_args = list(list(offset = rep(0, length(Y))))
+           )
+           return(p2sls_result$ESTIMATE[2])
+          },
+
+         NA)
+}
+```
+
+### Spatial variation
+
+```{r}
+set.seed(2025) 
+results_sp_loc <- list()
+n_simulations = 40
+
+N <- 50
+t <- 100
+m <- 3
+sigmaU <- diag(m)  # Update sigmaU based on N
+
+A <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
+R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+gamma <- 0.3 * (A %*% R) + 0.5 * A
+B_true <- diag(N)
+
+for (i in 1:n_simulations) {
+  # Generate data for the current setting
+  s <- matrix(runif(2 * N, -1, 1), ncol = 2) # N by 2
+  fs <- sin(2*pi*s[,1]*s[,2]) + s[,1] + s[,2] # N by 1
+  u <- mvtnorm::rmvnorm(t, sigma = sigmaU) # t * m
+
+  d <- u %*% t(A) + matrix(rep(fs^2/2,t), nrow=t, byrow=TRUE) + rnorm(t * N, sd = 0.2) # t by N
+  y <- d %*% t(B_true) + u %*% t(gamma) + matrix(rep(fs,t), nrow=t, byrow=TRUE) + rnorm(t * N, sd = 0.5) 
+  
+  # fit DML model
+  x <- data.frame(s1=rep(s[, 1], each = t), s2=rep(s[, 2], each = t))
+  # Polynomial spatial terms
+  x$s1_sq  <- x$s1^2
+  x$s2_sq  <- x$s2^2
+  x$s1_s2  <- x$s1 * x$s2
+  x$s1_cu  <- x$s1^3
+  x$s2_cu  <- x$s2^3
+  dml_rf <- dml_plm(as.matrix(x), as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+
+  # Loop over models
+  for (model in c("single_dml", "multi_dml", "stack_dml", "dml_mfactor",
+                  "nc_mfactor", "nc_2mfactor",
+                  "ife", "dml_ife", "proximal_dnc")) {
+    estimate <- fit_spatial_invariant(model, s, d, y, m, dml_rf)  # Fit the model 
+    print(model)
+    results_sp_loc[[length(results_sp_loc) + 1]] <- data.frame(
+      simulation = i,
+      model = model,
+      estimate = estimate
+    )
+  }
+}
+
+
+# Combine results into a data frame
+results1_df <- do.call(rbind, results_sp_loc)
+results1_df$error <- (results1_df$estimate - 1) / 1
+results1_df
+```
+
+```{r}
+results1_df <- results1_df %>%
+  mutate(model = case_when(
+    model == "single_dml" ~ "Single DML",
+    model == "multi_dml" ~ "Multi DML",
+    model == "stack_dml" ~ "Stacked DML",
+    model == "nc_mfactor" ~ "FC(3)",
+    model == "nc_2mfactor" ~ "FC(6)",
+    model == "dml_mfactor" ~ "FC(3)+DML",
+    model == "ife" ~ "IFE(6)",
+    model == "dml_ife" ~ "IFE(3)+DML",
+    model == "proximal_dnc" ~ "PCI",
+    TRUE ~ model
+  ))
+
+
+# Relative error
+p1 <- ggplot(results1_df, aes(x = model, y = error, fill = model)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  # facet_wrap(~setting, scales = "free") +
+  labs(title = "Fixed Spatial Effects and Spatially Invariant Confounding", 
+       x = "Model", 
+       y = "Relative Error",
+       fill = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+  ylim(-0.3, 1)
+p1
+
+# ggsave("sim_linear_factor_N50T100_sp_error.pdf", p1, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+```{r}
+u_s <- tibble(t = ds[,1], s1 = s[,1], s2 = s[,2])
+u_s %>%
+  ggplot(aes(x=s1, y=s2, color=t)) + 
+  geom_point(alpha=1, size=2.5) +
+  theme_bw() + colorspace::scale_color_continuous_diverging("Blue-Red 2")
+```
+
+### Spatiotemporal variation
+
+```{r, message=FALSE, warning=FALSE}}
+rho <- 0.9
+results_st_loc <- list()
+
+set.seed(2025) 
+n_simulations = 1
+
+N <- 50
+t <- 100
+m <- 3
+sigmaU <- diag(m) 
+shared_basis <- matrix(rnorm(N * m, mean = 0, sd=0.2), nrow = N, ncol = m)
+A <- 2 * shared_basis
+R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+gamma <- 0.4 * (shared_basis %*% R) + 0.6 * A
+B_true <- diag(N)
+
+for (j in 1:n_simulations) {
+  s <- matrix(runif(2 * N, -1, 1), ncol = 2) # N by 2
+  ds <- matrix(0, nrow=N, ncol=t) 
+  ds[,1] <- gp_sample(s, a2 = 0.6, l = 0.5, sigma2 = 1e-5)
+  for(i in 2:t) {
+    e_i <- gp_sample(s, a2 = 0.1, l = 0.5, sigma2 = 1e-5)
+    ds[,i] <- rho * ds[,i-1] + e_i
+  }
+  ys <- matrix(0, nrow=N, ncol=t) # n by t 
+  ys[,1] <- gp_sample(s, a2 = 0.6, l = 0.5, sigma2 = 1e-5)
+  for(i in 2:t) {
+    e_i <- gp_sample(s, a2 = 0.1, l = 0.5, sigma2 = 1e-5)
+    ys[,i] <- rho * ys[,i-1] + e_i
+  }
+  
+  u <- mvtnorm::rmvnorm(t, sigma = sigmaU) 
+  d <- t(ds) + u %*% t(A) + rnorm(t * N, sd = 0.1)
+  y <- t(ys) + d %*% t(B_true) + u %*% t(gamma) + rnorm(t * N, sd = 0.6)
+  
+  # fit DML model
+  x <- data.frame(s1=rep(s[, 1], each = t), s2=rep(s[, 2], each = t),
+                  time = rep(1:t, N))
+  # Polynomial spatial terms
+  x$s1_sq  <- x$s1^2
+  x$s2_sq  <- x$s2^2
+  x$s1_s2  <- x$s1 * x$s2
+  x$s1_cu  <- x$s1^3
+  x$s2_cu  <- x$s2^3
+
+  # Temporal polynomials
+  x$time_sq <- x$time^2
+  x$time_cu <- x$time^3
+
+  # Interaction between space and time
+  x$s1_time <- x$s1 * x$time
+  x$s2_time <- x$s2 * x$time
+  x$s1_s2_time <- x$s1 * x$s2 * x$time
+
+  # Periodic time terms (useful if there's any seasonality)
+  x$sin_time <- sin(2 * pi * x$time / t)
+  x$cos_time <- cos(2 * pi * x$time / t)
+  dml_rf <- dml_plm(as.matrix(x), as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+  
+  # Loop over models
+  for (model in c("single_dml", "multi_dml", "stack_dml", "dml_mfactor",
+                  "nc_mfactor", "nc_2mfactor",
+                  "ife", "dml_ife", "proximal_dnc")) {
+    estimate <- fit_spatial_invariant(model, s, d, y, m, dml_rf)  # Fit the model
+    print(model)
+    results_st_loc[[length(results_st_loc) + 1]] <- data.frame(
+      simulation = j,
+      model = model,
+      estimate = estimate
+    )
+  }
+}
+
+# Combine results into a data frame
+results2_df <- do.call(rbind, results_st_loc)
+results2_df$error <- (results2_df$estimate - 1) / 1
+results2_df
+```
+
+```{r}
+results2_df <- results2_df %>%
+  mutate(model = case_when(
+    model == "single_dml" ~ "Single DML",
+    model == "multi_dml" ~ "Multi DML",
+    model == "stack_dml" ~ "Stacked DML",
+    model == "nc_mfactor" ~ "FC(3)",
+    model == "nc_2mfactor" ~ "FC(6)",
+    model == "dml_mfactor" ~ "FC(3)+DML",
+    model == "ife" ~ "IFE(6)",
+    model == "dml_ife" ~ "IFE(3)+DML",
+    model == "proximal_dnc" ~ "PCI",
+    TRUE ~ model
+  ))
+
+# calculate bias for each model
+bias_df <- results2_df %>%
+  group_by(model) %>%
+  summarize(bias = mean(error))
+
+# calculate sd
+sd_df <- results2_df %>%
+  group_by(model) %>%
+  summarize(sd = sd(estimate))
+
+# Error for each setting
+p2 <- ggplot(results2_df, aes(x = model, y = error, fill = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  geom_boxplot() +
+  # facet_wrap(~setting, scales = "free") +
+  labs(title = "Spatiotemporal Effects and Spatially Invariant Confounding", 
+       x = "Model", 
+       y = "Relative Error",
+       fill = "Model") +
+  # theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+  ylim(-1, 1)
+p2
+
+# ggsave("sim_linear_factor_N50T100_random_error.pdf", p1, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+## Time-invariant confounding
+
+```{r}
+fit_time_invariant <- function(model, s, d, y, m, cache = NULL) {
+  n <- nrow(s)
+  t <- ncol(d)
+
+  switch(model,
+         single_dml = {
+           dml_rf <- dml_plm(s, d[,1], y[,1], dreg, yreg, nfold=5)
+           return(dml_rf$coef.est)
+         },
+
+         multi_dml = {
+           resY <- matrix(cache$resY, nrow=n)
+           resD <- matrix(cache$resD, nrow=n)
+           lm_model <- lm(resY ~ resD)
+           return(coef(lm_model)[2, 1])
+         },
+         
+         stack_dml = {
+           lm_model <- lm(cache$resY ~ cache$resD)
+           return(coef(lm_model)[2])
+         },
+
+         nc_mfactor = {
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=t, Q=t, N=n, M=m, d=d, y=y)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+
+         nc_2mfactor = {
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=t, Q=t, N=n, M=m*2, d=d, y=y)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+
+         dml_mfactor = {
+           resY <- matrix(cache$resY, nrow=n)
+           resD <- matrix(cache$resD, nrow=n)
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=t, Q=t, N=n, M=m, d=resD, y=resY)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+         
+         ife = {
+           df <- data.frame(unit = rep(1:n, t),
+                            time = rep(1:t, each = n),
+                            Y = c(y),
+                            D = c(d))
+           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m*2,
+                         force = "none", se = FALSE)
+           return(gs$beta)
+         },
+         
+         dml_ife = {
+           df <- data.frame(unit = rep(1:n, t),
+                            time = rep(1:t, each = n),
+                            Y = c(cache$resY),
+                            D = c(cache$resD))
+           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m,
+                         force = "none", se = FALSE)
+           return(gs$beta)
+         },
+         
+         proximal_dnc = {                 
+           resY <- matrix(cache$resY, nrow = n)   # T × n
+           resD <- matrix(cache$resD, nrow = n)
+        
+           if (n < m + 1)
+             stop("Need at least m+1 units to supply ", m, " NC pairs")
+  
+           Y <- c(resY[, 2:(t - 1)])      # previous outcome and next exposure as NC
+           A <- c(resD[, 2:(t - 1)])
+           W <- c(resY[, 1:(t - 2)])
+           Z <- c(resD[, 3:t])
+
+           p2sls_result <- p2sls.lm(
+             Y = Y,
+             A = A,
+             X = NULL,
+             W = W,
+             Z = Z,
+             nco_type = "linear",
+             nco_args = list(list(offset = rep(0, length(Y))))
+           )
+           return(p2sls_result$ESTIMATE[2])
+         },
+
+         NA)
+}
+```
+
+### Spatial variation
+
+```{r}
+set.seed(2025) 
+t <- 10 # number of time points or 
+n <- 500 # number of locations
+m <- 3 # numer of latent confounders
+sigmaU <- diag(m) 
+results_sp_time <- list()
+n_simulations <- 40
+
+A <- matrix(rnorm(t * m, mean = 0, sd=0.3), nrow = t, ncol = m)
+R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+gamma <- 0.2 * (A %*% R) + 0.5 * A
+B_true <- diag(t)
+  
+for (i in 1:n_simulations) {
+  # Generate data for the current setting
+  s <- matrix(runif(2 * n, -1, 1), ncol = 2) # N by 2
+  fs <- sin(2*pi*s[,1]*s[,2]) + s[,1] + s[,2] # N by 1
+  u <- mvtnorm::rmvnorm(n, sigma = sigmaU) # t * m
+  d <- u %*% t(A) + matrix(rep(fs^2/2, t), nrow=n, byrow=FALSE) + rnorm(n * t, sd = 0.2) # n by t
+  y <- d %*% t(B_true) + u %*% t(gamma) + matrix(rep(fs*2, t), nrow=n, byrow=FALSE) + rnorm(n * t, sd = 0.5) 
+  
+  # fit DML model
+  x <- data.frame(s1=rep(s[, 1], t), s2=rep(s[, 2], t))
+  # Polynomial spatial terms
+  x$s1_sq  <- x$s1^2
+  x$s2_sq  <- x$s2^2
+  x$s1_s2  <- x$s1 * x$s2
+  x$s1_cu  <- x$s1^3
+  x$s2_cu  <- x$s2^3
+  dml_rf <- dml_plm(as.matrix(x), as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+
+  # Loop over models
+  for (model in c("single_dml", "multi_dml", "stack_dml", "dml_mfactor",
+                  "nc_mfactor", "nc_2mfactor",
+                  "ife", "dml_ife", "proximal_dnc")) {
+    estimate <- fit_time_invariant(model, s, d, y, m, dml_rf)  # Fit the model
+    print(model)
+    results_sp_time[[length(results_sp_time) + 1]] <- data.frame(
+      simulation = i,
+      model = model,
+      estimate = estimate
+    )
+  }
+}
+results3_df <- do.call(rbind, results_sp_time)
+results3_df$error <- (results3_df$estimate - 1) / 1 
+results3_df
+```
+
+```{r}
+results3_df <- results3_df %>%
+  mutate(model = case_when(
+    model == "single_dml" ~ "Single DML",
+    model == "multi_dml" ~ "Multi DML",
+    model == "stack_dml" ~ "Stacked DML",
+    model == "nc_mfactor" ~ "FC(3)",
+    model == "nc_2mfactor" ~ "FC(6)",
+    model == "dml_mfactor" ~ "FC(3)+DML",
+    model == "ife" ~ "IFE(6)",
+    model == "dml_ife" ~ "IFE(3)+DML",
+    model == "proximal_dnc" ~ "PCI",
+    TRUE ~ model
+  ))
+
+p3 <- ggplot(results3_df, aes(x = model, y = error, fill = model)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  # facet_wrap(~setting, scales = "free") +
+  labs(title = "Spatiotemporal Effects and Time-Invariant Confounding", 
+       x = "Model", 
+       y = "Relative Error",
+       fill = "Model") +
+  # theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+  ylim(-0.2, 0.5)
+p3
+
+# ggsave("sim_linear_factor_N500T10_sp_error.pdf", p3, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+### Spatiotemporal variation
+
+
+```{r}
+set.seed(2025) 
+t <- 10  # number of time points
+n <- 500  # number of locations
+m <- 3  # number of latent confounders
+sigmaU <- diag(m)  
+results_st_time <- list()
+rho <- 0.9
+n_simulations <- 40
+
+A <- matrix(rnorm(t * m, mean = 0, sd=0.5), nrow = t, ncol = m)
+R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+gamma <- 0.2 * (A %*% R) + 0.5 * A
+
+for (j in 1:n_simulations) {
+  # Generate spatio-temporal component
+  s <- matrix(runif(2 * n, -1, 1), ncol = 2) # n by 2 locations
+  ds <- matrix(0, nrow=n, ncol=t) 
+  ds[,1] <- gp_sample(s, a2 = 1, l = 0.5, sigma2 = 1e-5)
+  for(i in 2:t) {
+    e_i <- gp_sample(s, a2 = 0.1, l = 0.5, sigma2 = 1e-5)
+    ds[,i] <- rho * ds[,i-1] + e_i
+  }
+  ys <- matrix(0, nrow=n, ncol=t) # n by t 
+  ys[,1] <- gp_sample(s, a2 = 1, l = 0.5, sigma2 = 1e-5)
+  for(i in 2:t) {
+    e_i <- gp_sample(s, a2 = 0.1, l = 0.5, sigma2 = 1e-5)
+    ys[,i] <- rho * ys[,i-1] + e_i
+  }
+  
+  # Generate treatment and outcome
+  u <- mvtnorm::rmvnorm(n, sigma = sigmaU) # n * m
+  d <- ds + u %*% t(A) + rnorm(n * t, sd = 0.2) # n by t
+  B_true <- diag(t)
+  y <- d %*% t(B_true) + ys + u %*% t(gamma) + rnorm(n * t, sd = 0.5)
+           
+  # fit DML model
+  x <- data.frame(s1=rep(s[, 1], t), s2=rep(s[, 2], t), time = rep(1:t, each = n))
+  # Polynomial spatial terms
+  x$s1_sq  <- x$s1^2
+  x$s2_sq  <- x$s2^2
+  x$s1_s2  <- x$s1 * x$s2
+  
+  # Temporal polynomials
+  x$time_sq <- x$time^2
+  
+  # Interaction between space and time
+  x$s1_time <- x$s1 * x$time
+  x$s2_time <- x$s2 * x$time
+  x$s1_s2_time <- x$s1 * x$s2 * x$time
+
+  # Periodic time terms (useful if there's any seasonality)
+  x$sin_time <- sin(2 * pi * x$time / t)
+  x$cos_time <- cos(2 * pi * x$time / t)
+  dml_rf <- dml_plm(as.matrix(x), as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+  
+  # Loop over models
+  for (model in c("single_dml", "multi_dml", "stack_dml", "dml_mfactor",
+                  "nc_mfactor", "nc_2mfactor",
+                  "ife", "dml_ife", "proximal_dnc")) {
+    estimate <- fit_time_invariant(model, s, d, y, m, dml_rf)  # Fit the model
+    print(model)
+    results_st_time[[length(results_st_time) + 1]] <- data.frame(
+      simulation = j,
+      model = model,
+      n = n,
+      t = t,
+      estimate = estimate
+    )
+  }
+}
+results4_df <- do.call(rbind, results_st_time)
+results4_df$error <- results4_df$estimate - 1
+results4_df
+```
+
+```{r}
+results4_df <- results4_df %>%
+  mutate(model = case_when(
+    model == "single_dml" ~ "Single DML",
+    model == "multi_dml" ~ "Multi DML",
+    model == "stack_dml" ~ "Stacked DML",
+    model == "nc_mfactor" ~ "FC(3)",
+    model == "nc_2mfactor" ~ "FC(6)",
+    model == "dml_mfactor" ~ "FC(3)+DML",
+    model == "ife" ~ "IFE(6)",
+    model == "dml_ife" ~ "IFE(3)+DML",
+    model == "proximal_dnc" ~ "PCI",
+    TRUE ~ model
+  ))
+
+p4 <- ggplot(results4_df, aes(x = model, y = error, fill = model)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  # facet_wrap(~setting, scales = "free") +
+  labs(title = "Spatiotemporal Effects and Time-Invariant Confounding", 
+       x = "Model", 
+       y = "Relative Error",
+       fill = "Model") +
+  # theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+  ylim(-0.2, 0.6)
+p4
+
+# ggsave("sim_linear_factor_N500T10_st_error.pdf", p4, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+## Different adjustment sets
+
+```{r}
+fit_adj_model <- function(model, s, d, y, m, cache = NULL) {
+  n <- nrow(s)
+  t <- ncol(d)
+  time <- 1:t
+
+  switch(model,
+         stack_dml = {
+           lm_model <- lm(cache$resY ~ cache$resD)
+           return(coef(lm_model)[2])
+         },
+
+         dml_factor = {
+           resY <- matrix(cache$resY, nrow=n)
+           resD <- matrix(cache$resD, nrow=n)
+           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           data_list <- list(K=t, Q=t, N=n, M=m, d=resD, y=resY)
+           opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
+           return(opt_result$mle("beta"))
+         },
+         
+         dml_ife = {
+           df <- data.frame(unit = rep(1:n, t),
+                            time = rep(1:t, each = n),
+                            Y = c(cache$resY),
+                            D = c(cache$resD))
+           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m,
+                         force = "none", se = FALSE)
+           return(gs$beta)
+         },
+
+         NA)
+}
+```
+
+```{r}
+N = 500
+t = 10
+beta = 1
+rho_H = 0.9
+rho_V = 0.8   
+
+set.seed(2025)
+results_adjust <- list()
+n_simulations <- 1
+
+a_ST <- 0.8; a_U1 <- rnorm(t, 0.5, 0.1); # a_U2 <- rnorm(t, -0.3, 0.1);
+a_V <- 0.4; a_S <- 0.4; a_W <- 0.4
+g_ST <- 0.6; g_U1 <- rnorm(t, 0.5, 0.1); # g_U2 <- rnorm(t, -0.2, 0.1);
+g_V <- 0.3; g_S <- 0.4; g_W <- 0.4
+
+  
+for (j in 1:n_simulations) {
+  s <- matrix(runif(N * 2, -1, 1), ncol = 2)
+  distM  <- rdist(s)
+  K <- exp(- distM^2 / (2 * 0.4^2)) + diag(1e-6, N)
+  
+  ## spatial GP for ST interaction term
+  G_i <- mvrnorm(1, mu = rep(0, N), Sigma = K)
+  
+  ## second spatial GP 
+  S_i <- mvrnorm(1, mu = rep(0, N), Sigma = K)
+  
+  ## time-invariant non-spatial confounder
+  U_i1 <- rnorm(N, sd = 1)
+  # U_i2 <- rnorm(N, sd = 1)
+  
+  ## AR-1 temporal driver for ST term
+  H_t <- numeric(t)
+  H_t[1] <- rnorm(1, mean = 1, sd = 0.3)
+  for(i in 2:t) H_t[i] <- rho_H * H_t[i-1] + rnorm(1, sd = sqrt(1 - rho_H^2))
+  
+  ## AR-1 time-varying confounder
+  V_t <- numeric(t)
+  V_t[1] <- rnorm(1, mean = 1, sd = 0.3)
+  for(i in 2:t) V_t[i] <- rho_V * V_t[i-1] + rnorm(1, sd = sqrt(1 - rho_V^2))
+  
+  ## spatiotemporal signal
+  ST_it <- outer(G_i, H_t)               # N × T
+  
+  W_it <- matrix(rnorm(N*t, 0, 1), N, t) 
+  # W_it <- outer(rnorm(N, 1, 0.5), arima.sim(list(ar = 0.9), n = t))
+  # w_i <- matrix(rnorm(N*5), N, 5)
+  # w_t <- matrix(arima.sim(list(ar = 0.8), n = t*5), t, 5)
+  # W_it <- w_i %*% t(w_t)
+  
+  # Generate D and Y
+  eps_D <- matrix(rnorm(N*t, 0, 0.3), N, t)   # measurement noise
+  eps_Y <- matrix(rnorm(N*t, 0, 0.5), N, t)
+  d <- a_ST*ST_it + # spatiotemporal component
+       outer(U_i1, a_U1) +   # static (non-spatial) confounder
+       # outer(a_V, V_t) + # time-varying confounder
+       a_V*matrix(rep(V_t, each=N), N) +
+       a_W*W_it + # time and spatial-varying
+       eps_D # varying coefficient?
+  
+  y <- beta*d +
+       g_ST*ST_it +
+       g_S*S_i +
+       outer(U_i1, g_U1) + 
+       # outer(g_V, V_t) +
+       g_V*matrix(rep(V_t, each=N), N) +
+       g_W*W_it +
+       eps_Y
+  
+  # # fit DML model
+  x <- data.frame(w = as.vector(W_it))
+  # s1=rep(s[, 1], t), s2=rep(s[, 2], t), time = rep(1:t, each = N) , u = rep(U_i, t), w= W_it)
+  
+  # # Polynomial spatial terms
+  # x$s1_sq  <- x$s1^2
+  # x$s2_sq  <- x$s2^2
+  # x$s1_s2  <- x$s1 * x$s2
+  # #
+  # # # Temporal polynomials
+  # x$time_sq <- x$time^2
+  # #
+  # # # Interaction between space and time
+  # x$s1_time <- x$s1 * x$time
+  # x$s2_time <- x$s2 * x$time
+  # x$s1_s2_time <- x$s1 * x$s2 * x$time
+  # #
+  # # # Periodic time terms (useful if there's any seasonality)
+  # x$sin_time <- sin(2 * pi * x$time / t)
+  # x$cos_time <- cos(2 * pi * x$time / t)
+  # 
+  dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+  
+  # Loop over models
+  for (model in c("stack_dml", "dml_factor","dml_ife")) {
+    estimate <- fit_adj_model(model, s, d, y, 3, dml_rf)  # Fit the model
+    print(model)
+    results_adjust[[length(results_adjust) + 1]] <- data.frame(
+      simulation = j,
+      model = model,
+      adj = "None",
+      estimate = estimate
+    )
+  }
+}
+
+results_adj_df <- do.call(rbind, results_adjust)
+results_adj_df$error <- results_adj_df$estimate - 1
+results_adj_df
+```
+
+```{r}
+results_adj_df <- results_adj_df %>%
+  mutate(adj = case_when(
+    adj == "No Adjustment" ~ "None",
+    adj == "All Confounders" ~ "All",
+    TRUE ~ adj
+  ))
+
+results_adj_df <- results_adj_df %>%
+  mutate(model = case_when(
+    model == "stack_dml" ~ "Naive",
+    model == "dml_factor" ~ "FC",
+    model == "dml_ife" ~ "IFE",
+    TRUE ~ model
+  ))
+
+results_adj_df$adj <- factor(results_adj_df$adj,
+  levels = c(
+    "None",
+    "Unit-specific",
+    "Spatiotemporal",
+    "All")
+)
+results_adj_df$model <- factor(results_adj_df$model, levels = c("Naive", "IFE", "FC"))
+
+p5 <- ggplot(results_adj_df,
+       aes(x     = adj,        # groups on the x-axis
+           y     = estimate,
+           fill  = model)) +              # colour = model
+
+  geom_boxplot(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 1,
+             linetype   = "dashed",
+             colour     = "red",
+             linewidth  = 0.4) +
+
+  labs(title = "Estimated Causal Effect by Model and Adjustment Set",
+       x     = "Adjustment Set",
+       y     = "Estimated Effect",
+       fill  = "Model") +
+
+  scale_fill_brewer(palette = "Set2") +
+  coord_cartesian(ylim = c(1, 2)) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1))
+p5
+# ggsave("sim_adjustment_N500T10.pdf", p5, width = 5, height = 5, units = "in", dpi = 300)
+```
+
+## Nonlinear effect
+
+```{r}
+# Simulation setting
+set.seed(123)
+n  <- 1000      # sample size
+d  <- 5         # # treatments / outcomes
+M  <- 2         # # latent factors
+p  <- 2         # # observed confounders
+
+# Coefficients
+beta_X  <- matrix(c( 1.0, -1.2,   # for D1
+                     0.8,  0.5,   # for D2
+                    -0.4,  1.0,   
+                     0.6, -0.7,
+                     1.5,  0.9), nrow = d, byrow = TRUE)   # d × p
+
+A_mat      <- matrix(c(1.0,  0.3,
+                       0.4, -0.8,
+                      -0.6,  1.0,
+                      -0.7,  -0.3,
+                       1.0, -0.5), nrow = d, byrow = TRUE) 
+Gamma_mat  <- matrix(c(0.4, -0.7,
+                      -0.3,  0.2,
+                       0.8,  0.2,
+                       0.2,  0.7,
+                       0.5,  0.4), nrow = d, byrow = TRUE) 
+
+# Generate data
+X        <- matrix(rnorm(n * p), n, p)              # (n × 2) observed confounders
+colnames(X) <- c("X1", "X2")
+
+V        <- matrix(rnorm(n * M), n, M)              # (n × 2) latent factors
+sigma_xi_vec  <- runif(d, 0.3, 0.5)  
+sigma_eps_vec <- runif(d, 0.3, 0.5)
+
+xi <- sapply(sigma_xi_vec, function(sd) rnorm(n, sd = sd))
+eps <- sapply(sigma_eps_vec, function(sd) rnorm(n, sd = sd))
+
+fD <- function(x1, x2, beta) {        # non‑linear f_Dj
+  beta[1] * sin(x1) + beta[2] * (x2^2 - 1)   # zero‑mean in x2
+}
+
+D <- matrix(NA, n, d)
+for (j in 1:d) {
+  mu_D      <- fD(X[,1], X[,2], beta_X[j, ])
+  D[, j]    <- mu_D + V %*% A_mat[j, ] + xi[, j]
+}
+colnames(D) <- paste0("D", 1:d)
+
+g_fun_list <- list(
+  function(d, x1, x2) tanh(d) + 0.8 * x1^2 - 0.6 * exp(-x2),
+  function(d, x1, x2) sin(d) + 0.7 * x1 * x2,
+  function(d, x1, x2) - 0.3 * d^2 + 0.5 * x1 + 0.6 * x2^2,
+  function(d, x1, x2) d^3 / (1 + d^2) + 0.3 * x1^2 - 0.4 * x2,
+  function(d, x1, x2) log(abs(d) + 1) + 0.4 * x1 - 0.2 * x2^2
+)
+
+Y <- matrix(NA, n, d)
+for (j in 1:d) {
+  g_j      <- g_fun_list[[j]]
+  mu_Y     <- g_j(D[, j], X[, 1], X[, 2])
+  Y[, j]   <- mu_Y + V %*% tilde_Gamma[j, ] + eps[, j]
+}
+colnames(Y) <- paste0("Y", 1:d)
+
+sim_data <- data.frame(X, D, Y)
+head(sim_data)
+
+# Bias
+Sigma_D  <- A_mat %*% t(A_mat) + diag(sigma_xi_vec^2)
+Sigma_VD <- diag(M) - t(A_mat) %*% solve(Sigma_D) %*% A_mat
+Sigma_VD_invhalf <- expm::sqrtm(solve(Sigma_VD))
+tilde_Gamma <- Gamma_mat %*% Sigma_VD_invhalf   #  Γ Σ_{V|D,X}^{-1/2}
+C_true <- Gamma_mat %*% Sigma_VD_invhalf %*% t(A_mat) %*%
+          solve(Sigma_D)  
+ind_bias <- diag(diag(d) %*% tilde_Gamma %*% t(A_mat) %*% diag(d) / Sigma_D)
+print(ind_bias)
+```
+
+Estimate bias matrix.
+```{r}
+set.seed(123)
+
+# -------------------------------------------
+# 0.  Helper: n‑fold cross‑fitting indices
+# K_fold <- 5
+# fold_id <- sample(rep(1:K_fold, length.out = nrow(sim_data)))
+
+# -------------------------------------------
+# 1. Estimate off-diagonal of C
+# for (j in 1:d) {
+#   # storage for residuals
+#   residD <- matrix(NA, nrow(sim_data), d-1)
+#   colnames(residD) <- paste0("D", setdiff(1:d, j))
+#   residY <- numeric(nrow(sim_data))
+# 
+#   for (fold in 1:K_fold) {
+#     train <- fold_id != fold
+#     test  <- fold_id == fold
+# 
+#     # flexible model for each D_{-j} and Y_j (here: thin‑plate splines)
+#     for (k in setdiff(1:d, j)) {
+#       form_k <- as.formula(
+#         paste0("D", k, " ~ ",
+#                "s(X1, k = 10) + s(X2, k = 10) + ",
+#                "s(D", j, ", k = 10)")
+#       )
+#       fDk <- gam(form_k, data = sim_data[train, ])
+#       residD[test, paste0("D", k)] <- sim_data[test, paste0("D", k)] -
+#         predict(fDk, newdata = sim_data[test, ])
+#     }
+#     form_Yj <- as.formula(
+#       paste0("Y", j, " ~ ",
+#              "s(X1, k = 10) + s(X2, k = 10) + ",
+#              "s(D", j, ", k = 10)")
+#     )
+#     fYj <- gam(form_Yj, data = sim_data[train, ])
+#     residY[test] <-
+#       sim_data[test, paste0("Y", j)] -
+#       predict(fYj, newdata = sim_data[test, ])
+#   }
+#   fit_j <- lm(residY ~ residD - 1)
+#   C_hat[j, -j] <- coef(fit_j)
+# }
+
+# for (fold in 1:K_fold) {
+#   train <- fold_id != fold;  test <- !train
+#   
+
+d <- 5  # number of treatments / outcomes
+M <- 2  # number of latent factors we simulated
+C_hat <- matrix(0, d, d)
+
+for (j in 1:d) {
+  form <- as.formula(
+    paste0("Y",j, " ~ ",
+           "s(D",j,", k = 10) +",          # flexible g_j(·)
+           "s(X1, k = 10) + s(X2, k = 10) + ",
+           paste(paste0("D", setdiff(1:d, j)), collapse = " + "))
+  )
+  fit <- mgcv::gam(form, data = sim_data)
+  
+  # linear coefficients come last in the param vector
+  C_hat[j, -j] <- coef(fit)[paste0("D", setdiff(1:d, j)) ]
+}
+
+off_diag_mask <- row(C_hat) != col(C_hat)
+print(sum(abs((C_hat-C_true)[off_diag_mask])))
+C_off <- C_hat  # store for Procrustes
+
+# -------------------------------------------
+# 2. Factor model on residuals and pinpoint C
+D_tilde <- matrix(NA, nrow(sim_data), d)
+colnames(D_tilde) <- paste0("D", 1:d)
+for (j in 1:d) {
+    fDj <- gam(sim_data[,paste0("D",j)] ~ s(X1)+s(X2),
+               data=sim_data)
+    D_tilde[,j] <- sim_data[,paste0("D",j)] - predict(fDj, sim_data)
+}
+
+Y_tilde <- matrix(NA, nrow(sim_data), d)
+colnames(Y_tilde) <- paste0("Y", 1:d)
+for (j in 1:d) {
+  form_Yj <- as.formula(
+    paste0("Y", j, " ~ ",
+           "s(X1, k = 10) + s(X2, k = 10) + ",
+           "s(D", j, ", k = 10) + ",
+           paste(paste0("D", setdiff(1:d, j)), collapse = " + "))
+    )
+  fYj <- gam(form_Yj, data = sim_data)
+  Y_tilde[,j] <- sim_data[,paste0("Y",j)] - predict(fYj, sim_data)
+}
+fa_res <- factanal(D_tilde, factors = M)
+A_hat <- as.matrix(fa_res$loadings)     # d × M
+sds   <- apply(D_tilde, 2, sd)       # standard deviations of columns
+A_hat <- A_hat * sds                 # scale loadings back to original scale
+psi_raw <- fa_res$uniquenesses         # vector of length d
+Psi_cov <- diag(psi_raw * sds^2)        # scale to original variance scale
+Sigma_D_hat <- A_hat %*% t(A_hat) + Psi_cov  
+
+fa_resY <- factanal(Y_tilde, M) # fa(D_tilde, nfactors = M, rotate = "none", scores = "regression")
+Gamma_hat <- as.matrix(fa_resY$loadings)   # d × M
+Gamma_hat <- Gamma_hat * sqrt(diag(cov(Y_tilde)))         
+
+Sigma_VD_hat <- diag(M) - t(A_hat) %*% solve(cov(D_tilde)) %*% A_hat
+Sigma_VD_hat <- (Sigma_VD_hat + t(Sigma_VD_hat))/2   # numerical stabilisation
+Sigma_VD_hat <- Sigma_VD_hat + 1e-8 * diag(M)
+
+inv_sqrt_Sigma_VD <- expm::sqrtm(solve(Sigma_VD_hat))
+R_hat  <- inv_sqrt_Sigma_VD %*% t(A_hat) %*% solve(cov(D_tilde))
+
+# Optimize on the Stiefel manifold
+# -------- objective:  ‖  W*(Γ Θ R − C_off) ‖_F²  --------------------
+Wmat <- matrix(1, d, d); diag(Wmat) <- 0
+obj_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat          # d × d
+  diff  <- (Mtmp - C_off) * Wmat                  # mask diag
+  sum(diff * diff)                                # Frobenius²
+}
+
+# gradient 
+grad_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat
+  diff  <- (Mtmp - C_off) * Wmat                  # d × d
+  2 * ( t(Gamma_hat) %*% diff %*% t(R_hat) )      # M × M
+}
+
+set.seed(111)
+best_obj <- Inf
+Theta_hat <- NULL
+n_starts <- 10  # try 5-20 for stability
+for (i in 1:n_starts) {
+  Theta_init <- rustiefel(M, M) 
+  current_result <- optStiefel(F = obj_fn,
+                          dF = grad_fn,
+                          Vinit = Theta_init, 
+                          # method="curvilinear",
+                          maxIters = 100,
+                          maxLineSearchIters = 100,
+                          tol = 1e-10,
+                          verbose = TRUE) # M × M orthogonal
+  current_obj <- obj_fn(current_result)
+  if (current_obj < best_obj) {
+    best_obj <- current_obj
+    Theta_hat <- current_result
+  }
+}
+
+# --------- recovered bias matrix ------------------------------------
+C_hat <- Gamma_hat %*% Theta_hat %*% R_hat
+C_hat1 <- C_off
+diag(C_hat1) <- diag(C_hat)
+print(round(C_true,3))
+print(round(C_hat1, 3))
+print(round(C_hat, 3))
+print(round(max(abs(C_hat - C_true)),3))
+
+# -------------------------------------------
+# 3.  Debias Y and estimate g_j(d)
+Y_db <- as.matrix(sim_data[, paste0("Y", 1:d)]) -
+        D_tilde %*% t(C_hat1)
+# Y_db <- as.matrix(sim_data[, paste0("Y", 1:d)]) -
+#         D_tilde %*% diag(ind_bias)
+
+# Dose–response at mean X  (we ignore X to mimic "average over X")
+x1_bar <- mean(sim_data$X1)
+x2_bar <- mean(sim_data$X2)
+
+g_fit  <- list()
+d_grid <- seq(-5, 5, length = 300)
+g_hat  <- matrix(NA, length(d_grid), d)
+
+for (j in 1:d) {
+  df <- data.frame(y = Y_db[, j],
+                   d = sim_data[, paste0("D", j)],
+                   x1 = sim_data$X1,
+                   x2 = sim_data$X2)
+  g_fit[[j]] <- gam(y ~ s(d, k = 20) + s(x1, k = 20) + s(x2, k = 20), data = df)
+  g_hat[, j] <- predict(g_fit[[j]], newdata = data.frame(
+    d = d_grid,
+    x1 = x1_bar,   # Fix x1, x2 at mean so only s(d) varies
+    x2 = x2_bar
+  ))   #,  type = "terms")[, "s(d)"]
+}
+plot_df <- data.frame(
+  d = rep(d_grid, d),
+  g = as.vector(g_hat),
+  outcome = factor(rep(1:d, each = length(d_grid)), labels = paste("Outcome", 1:d))
+)
+
+
+# -------------------------------------------
+# 4.  Plot of the five causal curves
+
+# Create true g_j curves at mean(X1, X2)
+g_true <- matrix(NA, length(d_grid), d)
+for (j in 1:d) {
+  g_j <- g_fun_list[[j]]
+  g_true[, j] <- g_j(d_grid, x1_bar, x2_bar)
+}
+
+# Prepare data frame for true g_j
+true_df <- data.frame(
+  d = rep(d_grid, d),
+  g = as.vector(g_true),
+  outcome = factor(rep(1:d, each = length(d_grid)), labels = paste("Outcome", 1:d))
+)
+
+# Create naive estimate 
+g_fit_naive  <- list()
+g_hat_naive  <- matrix(NA, length(d_grid), d)
+
+for (j in 1:d) {
+  df_naive <- data.frame(y = sim_data[, paste0("Y", j)],
+                         d = sim_data[, paste0("D", j)],
+                         x1 = sim_data$X1,
+                         x2 = sim_data$X2)
+  g_fit_naive[[j]] <- gam(y ~ s(d, k = 20) + s(x1, k = 20) + s(x2, k = 20), data = df_naive)
+  g_hat_naive[,j] <- predict(g_fit_naive[[j]], newdata = data.frame(
+    d = d_grid,
+    x1 = x1_bar,   # Fix x1, x2 at mean so only s(d) varies
+    x2 = x2_bar
+  ))         # ,  type = "terms")[, "s(d)"]
+}
+plot_df_naive <- data.frame(
+  d = rep(d_grid, d),
+  g = as.vector(g_hat_naive),
+  outcome = factor(rep(1:d, each = length(d_grid)), labels = paste("Outcome", 1:d))
+)
+
+# plot
+
+p6 <- ggplot() +
+  geom_line(data = plot_df, aes(x = d, y = g, color = "Debiased"), size = 1) +
+  geom_line(data = plot_df_naive, aes(x = d, y = g, color = "Naive"), linetype = "dotdash", size = 1) +
+  geom_line(data = true_df, aes(x = d, y = g, color = "True"), linetype = "dashed", size = 1) +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 3) +
+  scale_y_continuous(breaks = pretty_breaks(n = 5)) +
+  scale_color_manual(
+    values = c(
+      "Debiased" = "#0072B2",  # brighter blue
+      "Naive" = "#009E73",     # brighter green
+      "True" = "#E41A1C"       # brighter red-orange
+    ),
+    labels = c("Debiased Estimate", "Naive Estimate", "True Effect")
+  ) +
+  labs(
+    title = "Estimated Dose–Response Functions",
+    x = expression("Treatment Dose"),
+    y = expression("Causal Effect"),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.major = element_line(size = 0.2, color = "grey80"),
+    panel.grid.minor = element_blank(),
+    text = element_text(family = "serif"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+p6
+# ggsave("sim_nonlinear_Factor_5outcomes.pdf", p6, width = 6, height = 5, units = "in", dpi = 300)
+```
+Another estimator 
+```{r}
+# Factor loadings for exposures
+D_tilde <- matrix(NA, nrow(sim_data), d)
+colnames(D_tilde) <- paste0("D", 1:d)
+for (j in 1:d) {
+    fDj <- gam(sim_data[,paste0("D",j)] ~ s(X1)+s(X2),
+               data=sim_data)
+    D_tilde[,j] <- resid(fDj)
+}
+fa_res <- factanal(D_tilde, factors = M)
+A_hat <- as.matrix(fa_res$loadings)     # d × M
+sds   <- apply(D_tilde, 2, sd)       # standard deviations of columns
+A_hat <- A_hat * sds                 # scale loadings back to original scale
+psi_raw <- fa_res$uniquenesses         # vector of length d
+Psi_cov <- diag(psi_raw * sds^2)        # scale to original variance scale
+Sigma_D_hat <- A_hat %*% t(A_hat) + Psi_cov  
+print(Sigma_D_hat)
+```
+
+```{r}
+library(splines)
+library(glmmTMB)
+
+long <- sim_data |>
+  mutate(row_id = row_number()) |>
+  pivot_longer(cols = starts_with("Y"),
+               names_to  = "resp",
+               values_to = "Y") |>
+  mutate(resp = factor(resp, levels = paste0("Y",1:d)))
+
+## Dummy matrix for responses
+resp_mat <- model.matrix(~ resp - 1, long)   # n×d, columns respY1 … respY5
+
+## Helper to add basis × response interaction
+add_basis <- function(var, df = 6) {
+  B   <- bs(long[[var]], df = df)
+  out <- purrr::imap_dfc(as.data.frame(B), \(col, k){
+           base <- paste0("b", var, "_", k)
+           # multiply by each response dummy -> own columns
+           purrr::imap_dfc(as.data.frame(resp_mat), \(dum, rnm){
+               nm <- paste0(base, "_", rnm)
+               setNames(col * dum, nm)
+           })
+         })
+  out
+}
+
+## Build bases for D1..D5 and X1, X2
+basis_D <- purrr::map_dfc(paste0("D",1:d), add_basis, df = 6)
+basis_X1 <- add_basis("X1", df = 6)
+basis_X2 <- add_basis("X2", df = 6)
+
+long <- bind_cols(long, basis_D, basis_X1, basis_X2)
+
+############################################################
+## 4.  BUILD FORMULA  ######################################
+############################################################
+## (i) Causal matrix: resp:Dk gives one coefficient per Y_j × D_k
+CD_terms <- paste0("resp:D", 1:d, collapse = " + ")
+
+## (ii) Spline columns: include everything that starts with 'b'
+spline_cols <- grep("^b", names(long), value = TRUE)
+spline_terms <- paste(spline_cols, collapse = " + ")
+
+form <- as.formula(
+  paste("Y ~ resp +",          # intercepts
+        CD_terms, "+",
+        spline_terms,
+        "+ rr(resp + 0 | row_id, d = 2)"))   # rank-2 residual factors
+
+############################################################
+## 5.  FIT  ###############################################
+############################################################
+fit_Y <- glmmTMB(form, data = long, family = gaussian())
+
+############################################################
+## 6.  RESULTS  ############################################
+############################################################
+cat("\n=== Estimated causal-effect matrix  Ĉ  ====================\n")
+C_est <- summary(fit_Y)$coeff$cond |>
+  subset(grepl("^respY[1-5]:D", rownames(.))) |>
+  transform(Y = sub(":.*","",rownames(.)),
+            D = sub(".*:","",rownames(.))) |>
+  xtabs(Estimate ~ Y + D, data = _)
+print(round(C_est,3))
+
+cat("\n=== Γ̂  (residual factor loadings from rr()) ===============\n")
+print(round(getME(fit_Y, "fact_load")[[1]],3))
+```
+
+## Identification without factor model
+
+```{r}
+N <- 10
+t <- 100000
+m <- 3
+sigmaU <- diag(m)  # Update sigmaU based on N
+
+A <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
+R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+gamma <- 0.3 * (A %*% R) + 0.6 * A
+gamma <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
+B_true <- diag(N)
+
+Sigma_D  <- A %*% t(A) + diag(N) * 0.5^2
+C_true <- gamma %*% t(A) %*% solve(Sigma_D)  
+naive_true <- B_true + C_true
+
+# Generate data
+# s <- matrix(runif(2 * N, -1, 1), ncol = 2) # N by 2
+# fs <- sin(2*pi*s[,1]*s[,2]) + s[,1] + s[,2] # N by 1
+u <- mvtnorm::rmvnorm(t, sigma = sigmaU) # t * m
+
+d <- u %*% t(A) + rnorm(t * N, sd = 0.5) # t by N
+y <- d %*% t(B_true) + u %*% t(gamma) + rnorm(t * N, sd = 0.5) 
+
+      
+naive_hat  <- ((t(y) %*% d) / t) %*% solve(crossprod(d) / t)
+print(norm(naive_hat - naive_true, "F"))
+
+
+f <- function(b){
+  sv <- svd(naive_hat - b * diag(N))$d
+  sum(tail(sort(sv, decreasing = FALSE), N - m)^2)
+}
+beta_hat <- optimize(f, interval = c(-10, 10))$minimum
+C_hat    <- A_hat - beta_hat * diag(N)
+
+eig_vals <- eigen(naive_mat, only.values = TRUE)$values
+eig_vals_sorted <- sort(Re(eig_vals))           # ensure real/ordered
+
+beta_hat <- mean(eig_vals_sorted[1:(N - m)])    # mean of (N-m) repeated eigenvalues
+C_hat    <- naive_mat - beta_hat * diag(N)          # subtract β I
+print(norm(C_hat - C_true, "F"))
+print(beta_hat)
+```
+
+## Interference 
+
+```{r}
+
+```
+
+
+
