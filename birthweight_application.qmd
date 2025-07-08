@@ -1072,7 +1072,7 @@ run_analysis <- function(data,
   ci_95    <- coef_hat + c(-1.96, 1.96) * se_hat
 
   ## 1.3  Residuals to matrices -------------------------------------
-  resD_mat <- matrix(dml_fit$d_til, ncol = T_periods, byrow = TRUE)
+  resD_mat <- matrix(dml_fit$resD, ncol = T_periods, byrow = TRUE)
   resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
 
   ## 1.4  Stan (Factor model VB) ------------------------------------
@@ -1094,7 +1094,7 @@ run_analysis <- function(data,
             unit = rep(1:N_units, each = T_periods), # unit
             time = rep(1:T_periods, N_units),
             Y    = dml_fit$resY,
-            D    = dml_fit$d_til
+            D    = dml_fit$resD
           )
   # flip time and unit does not change much
   fe_fit <- interFE(Y ~ D, data = df_fe,
