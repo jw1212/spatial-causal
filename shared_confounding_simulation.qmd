@@ -584,7 +584,6 @@ p3
 
 ### Spatiotemporal variation
 
-
 ```{r}
 set.seed(2025) 
 t <- 10  # number of time points
@@ -970,6 +969,7 @@ print(ind_bias)
 ```
 
 Estimate bias matrix.
+
 ```{r}
 set.seed(123)
 
@@ -1236,7 +1236,9 @@ p6 <- ggplot() +
 p6
 # ggsave("sim_nonlinear_Factor_5outcomes.pdf", p6, width = 6, height = 5, units = "in", dpi = 300)
 ```
-Another estimator 
+
+Another estimator
+
 ```{r}
 # Factor loadings for exposures
 D_tilde <- matrix(NA, nrow(sim_data), d)
@@ -1374,11 +1376,160 @@ print(norm(C_hat - C_true, "F"))
 print(beta_hat)
 ```
 
-## Interference 
+## Interference
 
 ```{r}
+fit_spatial_inter <- function(model, d, d_nb, y, m) {
+  t <- nrow(d); n <- ncol(d)
 
+  switch(model,
+
+    # -------------------------------------------------- 1. Naïve OLS
+    naive = {
+      df <- data.frame(
+        Y    = c(y),
+        D    = c(d),
+        D_nb = c(d_nb)
+      )
+      ols <- lm(Y ~ D + D_nb, data = df)
+      return(coef(ols)[c("D", "D_nb")])        #  (β1, β2)
+    },
+
+    # -------------------------------------------------- 2. Factor model
+    nc_factor = {
+      sm_factor <- cmdstanr::cmdstan_model(
+        "stan/spatial_inter_linear_factor.stan"
+      )
+      data_list <- list(K = n, N = t, M = m,
+                        d = d, y = y, d_nb = d_nb) 
+      opt_result <- sm_factor$optimize(data = data_list,
+                                       init = 2, iter = 1000,
+                                       show_messages = FALSE)
+      return(opt_result$mle(c("beta1", "beta2")))
+    },
+
+    # -------------------------------------------------- 3. IFE / interactive FE
+    ife = {
+      df <- data.frame(unit = rep(1:n, each = t),
+                       time = rep(1:t,  n),
+                       Y = c(y),
+                       D = c(d),  
+                       D_nb = c(d_nb))
+      gs <- interFE(
+              Y ~ D + D_nb,
+              data  = df,
+              index = c("unit", "time"),
+              r     = m,
+              force = "none",
+              se    = FALSE
+            )
+      return(gs$beta)
+    },
+
+    stop("Unknown model name")
+  )
+}
 ```
 
+```{r}
+# rho <- 0.9
+models <- c("naive", "nc_factor", "ife")
+results_inter_sim <- data.frame() # will grow row-wise
 
+set.seed(2025) 
+n_sim = 100
 
+N <- 50
+t <- 200
+m <- 4
+sigmaU <- diag(m) 
+A_self <- matrix(rnorm(N * (m-1), mean = 0, sd=0.5), nrow = N, ncol = (m-1))
+A_nb_col <- rnorm(N, 0, 0.5)  
+A <- cbind(A_self,  A_nb_col)    
+R <- qr.Q(qr(matrix(rnorm((m-1) * (m-1)), (m-1)))) 
+gamma_self <- 0.3 * (A_self %*% R) + 0.5 * A_self
+gamma_nb_col  <- W %*% A_nb_col
+gamma  <- cbind(gamma_self, gamma_nb_col)
+
+B_true <- diag(N)
+
+## interference
+k_neigh   <- 3          # number of nearest neighbours whose exposure spills over
+beta_self <- 1.0        # effect of the unit’s own exposure D_it
+beta_nb   <- 0.5        # effect of neighbours’ average exposure
+
+for (sim in seq_len(n_sim)) {
+  print(paste("iteration", sim))
+  s <- matrix(runif(2 * N, -1, 1), ncol = 2) # N by 2
+  
+  ## Build a k-NN weight matrix W  (rows = recipients i, cols = senders j)
+  knn_idx <- get.knn(s, k = k_neigh)$nn.index   # N × k matrix of neighbour indices
+  
+  W <- matrix(0, N, N)                          # raw adjacency
+  for (i in 1:N) W[i, knn_idx[i, ]] <- 1
+  W <- W / rowSums(W)                           # row-standardize to averages
+  
+  ## Exposure-to-outcome coefficient matrix that embeds interference
+  B_true <- beta_self * diag(N) + beta_nb * W   # N × N  (diag = own effect)
+  
+  ## Simulate factor confounders, exposures D, and outcomes Y
+  u <- mvtnorm::rmvnorm(t, sigma = sigmaU)      # t × m   (time rows)
+  
+  d <- u %*% t(A) + rnorm(t * N, sd = 0.2)      # t(ds) + exposures  (t × N)
+  d_nb <- d %*% t(W)                    # t by N matrix of neighbour averages
+
+  y <-  d %*% t(B_true) +                       # own + neighbour exposures
+        u %*% t(gamma) +                        # shared factor confounding
+        rnorm(t * N, sd = 0.5)                  # idiosyncratic noise
+                                                # t(ys) +
+  for (mod in models) {
+    theta_hat <- fit_spatial_inter(mod, d, d_nb, y, m)
+
+    results_inter_sim <- rbind(
+      results_inter_sim,
+      data.frame(sim      = sim,
+                 model    = mod,
+                 beta_self_hat = theta_hat[1],
+                 beta_nb_hat   = theta_hat[2])
+    )
+  }
+}
+results_inter_sim <- results_inter_sim %>%
+  mutate(model = case_when(
+    model == "naive" ~ "DML (NUC)",
+    model == "nc_factor" ~ "FC",
+    model == "ife" ~ "IFE",
+    TRUE ~ model
+  ))
+head(results_inter_sim)
+```
+
+```{r}
+results_long <- results_inter_sim %>%     
+  transmute(model,
+            Direct   = beta_self_hat,
+            Indirect = beta_nb_hat) %>%                            # keep estimates
+  pivot_longer(cols = c(Direct, Indirect),
+               names_to   = "effect",
+               values_to  = "estimate") %>%
+  mutate(true = ifelse(effect == "Direct",  beta_self, beta_nb),
+         rel_error = (estimate - true) / true)   
+
+results_long$model <- factor(results_long$model, levels = c("DML (NUC)", "IFE", "FC"))
+
+p7 <- ggplot(results_long,
+       aes(x = model, y = estimate, fill = model)) +
+  geom_boxplot(width = 0.7, outlier.size = 0.7, alpha = 0.8) +
+  geom_hline(data = distinct(results_long, effect, true),
+             aes(yintercept = true), linetype = "dashed",
+             colour = "red", size = 0.4) +
+  facet_wrap(~ effect, scales = "free_y") +
+  labs(title = "Direct and Indirect Effect Estimates under Spatial Interference",
+       x = "Estimator",
+       y = "Estimated Effect",
+       fill = "Estimator") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+```
