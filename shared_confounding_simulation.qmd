@@ -1,7 +1,7 @@
 ---
 title: "Shared confounding Simulation"
 format: html
-editor: visual
+editor: source
 ---
 
 ```{r}
@@ -256,16 +256,17 @@ results1_df <- results1_df %>%
 
 
 # Relative error
-p1 <- ggplot(results1_df, aes(x = model, y = error, fill = model)) +
-  geom_boxplot() +
+## results1_df <- readRDS("data/sim_linear_factor_N50T100_sp.rds")
+p1 <- ggplot(results1_df, aes(x = model, y = error)) +
+  geom_boxplot(fill = "dark gray", outliers=FALSE) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
   # facet_wrap(~setting, scales = "free") +
   labs(title = "Fixed Spatial Effects and Spatially Invariant Confounding", 
        x = "Model", 
        y = "Relative Error",
        fill = "Model") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
-  ylim(-0.3, 1)
+  theme_bw(base_size=16) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") 
 p1
 
 # ggsave("sim_linear_factor_N50T100_sp_error.pdf", p1, width = 6, height = 5, units = "in", dpi = 300)
@@ -387,17 +388,19 @@ sd_df <- results2_df %>%
   summarize(sd = sd(estimate))
 
 # Error for each setting
-p2 <- ggplot(results2_df, aes(x = model, y = error, fill = model)) +
+
+## results2_df <- readRDS("data/sim_linear_factor_N500T10_sp.rds")
+p2 <- ggplot(results2_df |> filter(model != "PCI"), 
+  aes(x = model, y = error)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
-  geom_boxplot() +
+  geom_boxplot(fill = "dark gray") +
   # facet_wrap(~setting, scales = "free") +
   labs(title = "Spatiotemporal Effects and Spatially Invariant Confounding", 
        x = "Model", 
        y = "Relative Error",
        fill = "Model") +
-  # theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
-  ylim(-1, 1)
+  theme_bw(base_size=16) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
 p2
 
 # ggsave("sim_linear_factor_N50T100_random_error.pdf", p1, width = 6, height = 5, units = "in", dpi = 300)
@@ -566,15 +569,16 @@ results3_df <- results3_df %>%
     TRUE ~ model
   ))
 
-p3 <- ggplot(results3_df, aes(x = model, y = error, fill = model)) +
-  geom_boxplot() +
+## results3_df <- readRDS("data/sim_linear_factor_N50T100_st.rds")
+p3 <- ggplot(results3_df |> filter(model != "PCI"), aes(x = model, y = error)) +
+  geom_boxplot(fill = "dark gray") +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
   # facet_wrap(~setting, scales = "free") +
   labs(title = "Spatiotemporal Effects and Time-Invariant Confounding", 
        x = "Model", 
        y = "Relative Error",
        fill = "Model") +
-  # theme_minimal() +
+  theme_bw(base_size=16) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
   ylim(-0.2, 0.5)
 p3
@@ -675,15 +679,16 @@ results4_df <- results4_df %>%
     TRUE ~ model
   ))
 
-p4 <- ggplot(results4_df, aes(x = model, y = error, fill = model)) +
-  geom_boxplot() +
+## results4_df <- readRDS("data/sim_linear_factor_N500T10_st.rds")
+p4 <- ggplot(results4_df |> filter(model != "PCI"), aes(x = model, y = error)) +
+  geom_boxplot(fill = "dark gray") +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
   # facet_wrap(~setting, scales = "free") +
   labs(title = "Spatiotemporal Effects and Time-Invariant Confounding", 
        x = "Model", 
        y = "Relative Error",
        fill = "Model") +
-  # theme_minimal() +
+  theme_bw(base_size=16) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
   ylim(-0.2, 0.6)
 p4
@@ -1518,13 +1523,13 @@ results_long <- results_inter_sim %>%
 results_long$model <- factor(results_long$model, levels = c("DML (NUC)", "IFE", "FC"))
 
 p7 <- ggplot(results_long,
-       aes(x = model, y = estimate, fill = model)) +
-  geom_boxplot(width = 0.7, outlier.size = 0.7, alpha = 0.8) +
+       aes(x = model, y = estimate)) +
+  geom_boxplot(width = 0.7, alpha = 0.8, fill="dark gray", outliers=FALSE) +
   geom_hline(data = distinct(results_long, effect, true),
              aes(yintercept = true), linetype = "dashed",
              colour = "red", size = 0.4) +
   facet_wrap(~ effect, scales = "free_y") +
-  labs(title = "Direct and Indirect Effect Estimates under Spatial Interference",
+  labs(title = "Estimated Direct and Nearest Neighbor Effects",
        x = "Estimator",
        y = "Estimated Effect",
        fill = "Estimator") +
@@ -1532,6 +1537,8 @@ p7 <- ggplot(results_long,
   theme_bw() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
         legend.position = "none")
+
+ggsave("sim_interference.png", p7, width = 8, height = 5)
 ```
 
 ## Violation of normality
