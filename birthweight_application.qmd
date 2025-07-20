@@ -1216,6 +1216,125 @@ p_omit
 # ggsave("bw_vary_adjustments_1.pdf", p_omit, width = 6.5, height = 5, units = "in", dpi = 300)
 ```
 
+## Interference
+
+```{r}
+run_time_inter_analysis <- 
+  function(data,
+           adj_cols = character(0L),   # adjustment set X
+           d_col     = "pm25",          # treatment   column
+           y_col     = "bw_mean",       # outcome     column
+           unit_col  = "unit",          # ID for interFE
+           time_col  = "time",          # ID for interFE
+           T_periods = 7L,              # # of time points
+           M_factors = 3L,              # # of latent factors in Stan
+           nfold     = 5L,
+           vb_draws  = 2000L,
+           seed      = 123,
+           d_inter_col = "pm25_lag") {
+  
+  N_units <- nrow(data) / T_periods
+  
+  ## Split variables -------------------------------------------
+  X <- if (length(adj_cols)) data[, adj_cols, drop = FALSE] else NULL
+  d <- data[[d_col]]
+  y <- data[[y_col]]
+
+  ## Naive DML --------------------------------------------------------
+  set.seed(seed)
+  dml_fit <- dml_plm(X, d, y, dreg, yreg, nfold = nfold)
+  
+  res_df <- data.frame(
+    unit = rep(1:N_units, each = T_periods),
+    time = rep(1:T_periods, N_units),
+    resY = dml_fit$resY,
+    resD = dml_fit$resD
+  )
+  res_df <- res_df |>
+    dplyr::group_by(unit) |>
+    dplyr::mutate(resD_lag = dplyr::lag(resD)) |>
+    dplyr::ungroup() |>
+    dplyr::filter(time > 1)
+  
+  reg <- lm(resY ~ resD + resD_lag, data = res_df)
+
+  # Sandwich SEs
+  vcov_hc <- sandwich::vcovHC(reg, type = "HC3")
+  reg_test <- lmtest::coeftest(reg, vcov. = vcov_hc)
+  dml_summary <- broom::tidy(reg_test) %>%
+  dplyr::mutate(
+    ci_lower = estimate - 1.96 * std.error,
+    ci_upper = estimate + 1.96 * std.error
+    ) %>%
+    dplyr::select(term, estimate, std.error, ci_lower, ci_upper)
+  
+  # IFE
+  fe_fit <- interFE(resY ~ resD + resD_lag,
+                    data  = as.data.frame(res_df),
+                    index = c("unit", "time"),
+                    r     = M_factors,
+                    force = "none",
+                    nboots = 200)
+  
+  ## Residuals to matrices -------------------------------------
+  resD_mat <- matrix(dml_fit$resD, ncol = T_periods, byrow = TRUE)
+  resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
+
+  ## Stan (Factor model VB) ------------------------------------
+  stan_data <- list(
+    K = T_periods, Q = T_periods, N = N_units,
+    M = M_factors, d = resD_mat,  y = resY_mat
+  )
+  sm_factor <- cmdstanr::cmdstan_model("stan/time_inter_factor.stan")
+  vb_fit <- sm_factor$variational(data = stan_data, seed = seed, draws = vb_draws)
+  vb_summary <- posterior::summarise_draws(
+    vb_fit$draws(variables = c("beta0", "beta1", "beta2")),
+    mean,
+    ~quantile(.x, probs = c(0.025, 0.975))
+    )
+  vb_summary_df <- as.data.frame(vb_summary)
+  colnames(vb_summary_df) <- c("term", "estimate", "ci_lower", "ci_upper")
+  vb_summary_df$term <- c("initial", "direct", "indirect")
+
+  ## 1.6  Return --------------------------------------------
+  result_df <- 
+    rbind(dml_summary[2:3,c(1:2,4:5)] %>% 
+            mutate(model = "DML (NUC)", term = c("Direct", "Lagged")),
+          vb_summary_df[2:3,] %>% 
+            mutate(model = "FC", term = c("Direct", "Lagged")),
+          fe_fit$est.table %>%
+            as.data.frame() %>%
+            tibble::rownames_to_column("term") %>%
+            filter(term %in% c("resD", "resD_lag")) %>%
+            mutate(
+              term = c("Direct", "Lagged"),
+              model = "IFE"
+            ) %>%
+            dplyr::select(term, estimate = Coef, ci_lower = CI.lower, ci_upper = CI.upper, model)
+          )
+  return(result_df)
+}
+```
+
+```{r}
+results_inter_all <- 
+  run_time_inter_analysis(merged_bw_df_selected,
+                          adj_cols= colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)])
+results_inter_all <- results_inter_all %>% mutate(setting = "All covariates")
+```
+
+```{r}
+ggplot(results_inter, aes(x = model, y = estimate, color = term, shape = term)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                width = 0.2,
+                position = position_dodge(width = 0.5)) +
+  facet_wrap(~ setting, nrow = 1) +
+  labs(x = "Model", y = "Estimate", title = "Direct and Lagged Effects with 95% CI") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+```
+
 ## Double negative control
 
 ```{r}
