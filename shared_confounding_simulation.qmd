@@ -257,7 +257,7 @@ results1_df <- results1_df %>%
 
 # Relative error
 ## results1_df <- readRDS("data/sim_linear_factor_N50T100_sp.rds")
-p1 <- ggplot(results1_df, aes(x = model, y = error)) +
+p1 <- ggplot(results1_df |> filter(model != "PCI"), aes(x = model, y = error)) +
   geom_boxplot(fill = "dark gray", outliers=FALSE) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
   # facet_wrap(~setting, scales = "free") +
@@ -955,7 +955,7 @@ Y <- matrix(NA, n, d)
 for (j in 1:d) {
   g_j      <- g_fun_list[[j]]
   mu_Y     <- g_j(D[, j], X[, 1], X[, 2])
-  Y[, j]   <- mu_Y + V %*% tilde_Gamma[j, ] + eps[, j]
+  Y[, j]   <- mu_Y + V %*% Gamma_mat[j, ] + eps[, j]
 }
 colnames(Y) <- paste0("Y", 1:d)
 
@@ -1107,8 +1107,8 @@ best_obj <- Inf
 Theta_hat <- NULL
 n_starts <- 10  # try 5-20 for stability
 for (i in 1:n_starts) {
-  Theta_init <- rustiefel(M, M) 
-  current_result <- optStiefel(F = obj_fn,
+  Theta_init <- rstiefel::rustiefel(M, M) 
+  current_result <- rstiefel::optStiefel(F = obj_fn,
                           dF = grad_fn,
                           Vinit = Theta_init, 
                           # method="curvilinear",
@@ -1223,7 +1223,7 @@ p6 <- ggplot() +
   ) +
   labs(
     title = "Estimated Dose–Response Functions",
-    x = expression("Treatment Dose"),
+    x = expression("Difference from Dose 0"),
     y = expression("Causal Effect"),
     color = NULL
   ) +

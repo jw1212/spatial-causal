@@ -12,6 +12,7 @@ library(car)
 library(randomForest) 
 library(tidybayes)
 library(bayesplot)
+library(gsynth)
 # library(colorspace)
 
 library(tigris)
@@ -765,7 +766,7 @@ print(vif(lm(bw_mean ~ ., data = merged_bw_df_selected %>% dplyr::select(-zip, -
 
 ```{r}
 # saveRDS(merged_bw_df_selected, file = "birthweight_data_preprocess.rds")
-# merged_bw_df_selected <- readRDS("birthweight_data_preprocess.rds")
+merged_bw_df_selected <- readRDS("birthweight_data_preprocess.rds")
 ```
 
 ## Partially linear model
@@ -1081,7 +1082,7 @@ run_analysis <- function(data,
     K = T_periods, Q = T_periods, N = N_units,
     M = M_factors, d = resD_mat,  y = resY_mat
   )
-  sm_factor <- cmdstanr::cmdstan_model("stan/time_nc_factor.stan")
+  sm_factor <- cmdstanr::cmdstan_model("stan/time_nc_factor_twfe.stan")
   vb_fit <- sm_factor$variational(data = stan_data, seed = seed, draws = vb_draws)
   vb_sum <- posterior::summarise_draws(
               vb_fit$draws("beta"),
@@ -1101,7 +1102,7 @@ run_analysis <- function(data,
                     index = c("unit", "time"),
                     r     = M_factors,
                     force = "none",
-                    nboots = 300)
+                    nboots = 100)
 
   ## 1.6  Return --------------------------------------------
   list(
@@ -1119,6 +1120,168 @@ ev <- eigen(cor(resD_mat))  # X should be standardized
 nScreeObj <- nScree(x = ev$values)
 plotnScree(nScreeObj)
 nScreeObj$Components   
+```
+
+```{r}
+library(parallel)
+
+# Set up parallel processing
+
+
+
+cov_list <- list(income=7, age = 11:19, race = 20:26, educ=27:30, foreign = 31, care = 32:35)
+
+# Create a list of all tasks to run in parallel
+all_tasks <- list()
+task_id <- 1
+
+for(i in 6:0) {
+  combinations <- combn(6, i)
+  for(j in 1:ncol(combinations)) {
+    indices <- unlist(cov_list[combinations[, j]])
+    adj_cols <- colnames(merged_bw_df_selected)[c(2, 4:5, indices)]
+    
+    # Store each task as a list
+    all_tasks[[task_id]] <- list(
+      i = i,
+      j = j,
+      adj_cols = adj_cols
+    )
+    task_id <- task_id + 1
+  }
+}
+
+cat("Total tasks to run:", length(all_tasks), "\n")
+
+# Define a function to run a single task
+run_single_task <- function(task) {
+  result <- run_analysis(merged_bw_df_selected, adj_cols = task$adj_cols)
+  return(list(
+    i = task$i,
+    j = task$j,
+    result = result
+  ))
+}
+
+# Run all tasks in parallel
+cat("Starting parallel processing...\n")
+start_time <- Sys.time()
+
+all_results <- mclapply(
+  all_tasks,
+  run_single_task,
+  mc.cores = length(all_tasks),
+  mc.set.seed = TRUE  # Ensures reproducible results
+)
+
+end_time <- Sys.time()
+cat("Parallel processing completed in:", round(difftime(end_time, start_time, units = "mins"), 2), "minutes\n")
+
+# Reorganize results back into the original nested structure
+results_list <- list()
+for(i in 6:0) {
+  results_list[[as.character(i)]] <- list()
+}
+
+for(task_result in all_results) {
+  i <- task_result$i
+  j <- task_result$j
+  results_list[[as.character(i)]][[j]] <- task_result$result
+}
+
+# Save results
+saveRDS(results_list, file = "results_list2.RDS")
+cat("Results saved to results_list.RDS\n")
+```
+
+```{r}
+# Extract results from results_list
+results_list <- readRDS("results_list2.RDS")
+
+# Create a function to extract estimates from each result
+extract_estimates <- function(result) {
+  list(
+    dml_coef = result$dml_coef,
+    factor_conf = result$vb_summary$mean,
+    interFE_est = result$interFE_est
+  )
+}
+
+combination_names <- c(
+  "All 6 covariates",
+  "Any 5 covariates", 
+  "Any 4 covariates",
+  "Any 3 covariates", 
+  "Any 2 covariates",
+  "Any 1 covariates",
+  "No covariates"
+)
+
+# Extract all estimates
+plot_data <- tibble()
+
+for(i in 6:0) {
+  len <- length(results_list[[as.character(i)]])
+  if(len > 0) {
+    # For each combination at level i
+    estimates_i <- map(results_list[[as.character(i)]], extract_estimates)
+    
+    # Calculate mean estimates across all combinations at this level
+    mean_dml <- map_dbl(estimates_i, "dml_coef")
+    mean_factor <- map_dbl(estimates_i, "factor_conf")
+    mean_interFE <- map_dbl(estimates_i, "interFE_est")
+    
+    # Add to plot data
+    plot_data <- bind_rows(
+      plot_data,
+      tibble(
+        setting = combination_names[7-i],
+        model = rep(c("Naïve DML", "Factor Confounding", "IFE"), each = len),
+        estimate = c(mean_dml, mean_factor, mean_interFE) * 10, # Convert to per 10 µg/m³
+      )
+    )
+  }
+}
+
+# Set factor levels to preserve order
+plot_data$setting <- factor(plot_data$setting, levels = combination_names)
+plot_data$model <- factor(plot_data$model, levels = c("Naïve DML", "Factor Confounding", "IFE"))
+
+plot_data |> group_by(setting, model) |>
+  summarise(mean = mean(estimate), sd = sd(estimate), .groups = "drop") |>
+  arrange(setting, sd) |>
+  ggplot() + geom_col(aes(x = setting, y = sd, fill = model), position="dodge") + theme_bw(base_size = 16) + ylab("Standard Deviation of Estimates")
+ggsave("tmp_sd.png", width=14)
+
+plot_data |> group_by(setting, model) |>
+  summarise(mean = mean(estimate), sd = sd(estimate), .groups = "drop") |>
+  arrange(setting, sd) |>
+  ggplot() + geom_col(aes(x = setting, y = mean, fill = model), position="dodge") + theme_bw(base_size = 16) + ylab("Mean of Estimates")
+ggsave("tmp_mean.png", width=14)
+# Create the plot
+p_combinations <- ggplot(plot_data,
+       aes(x = setting,
+           y = estimate,
+           colour = model)) +
+  geom_point(position = position_dodge(width = .35),
+             size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Estimates by Number of Covariate Groups Included",
+       x = "Covariate Groups Included",
+       y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase",
+       colour = NULL) +
+  scale_colour_manual(values = c("Naïve DML" = "#0072B2",
+                                 "Factor Confounding" = "firebrick",
+                                 "IFE" = "#009E73")) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 0.9),
+        panel.grid.minor = element_blank())
+
+p_combinations
+
+ggsave("tmp.png")
+
 ```
 
 ```{r}
