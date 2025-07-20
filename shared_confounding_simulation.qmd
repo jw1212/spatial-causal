@@ -1681,7 +1681,7 @@ results_non_Gaussian_df <- results_non_Gaussian_df %>%
     error == "hetero" ~ "Heteroskedastic"
     ))
 
-# saveRDS(results_non_Gaussian_df, file = "sim_nonGaussian_estimate.rds")
+# saveRDS(results_non_Gaussian_df, file = "sim_nonGaussian_N50T100.rds")
 ```
 
 ```{r}
@@ -1706,5 +1706,5 @@ p8 <- ggplot(results_non_Gaussian_df,
   ) +
   coord_cartesian(ylim = c(0.95, 1.35))
 
-# ggsave("sim_nonGaussian_estimate.pdf", p8, width = 6, height = 5, units = "in", dpi = 300)
+# ggsave("sim_nonGaussian_N50T100.pdf", p8, width = 6, height = 5, units = "in", dpi = 300)
 ```
