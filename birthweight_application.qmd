@@ -1382,8 +1382,26 @@ p_omit
 ## Interference
 
 ```{r}
+zip_s <- merged_bw_df_selected %>%
+  dplyr::select(zip, long, lat) %>%
+  distinct()
+
+## Build a k-NN weight matrix W  (rows = recipients i, cols = senders j)
+knn_idx <- get.knn(zip_s %>%
+                     dplyr::select(long, lat) %>%
+                     as.matrix(),
+                   k = 5)$nn.index   # N × k matrix of neighbour indices
+
+n_zip <- nrow(zip_s)
+W_units <- matrix(0, n_zip, n_zip)                          # raw adjacency
+for (i in 1:n_zip) W_units[i, knn_idx[i, ]] <- 1
+W_units <- W_units / rowSums(W_units)  
+```
+
+```{r}
 run_time_inter_analysis <- 
   function(data,
+           W_units,
            adj_cols = character(0L),   # adjustment set X
            d_col     = "pm25",          # treatment   column
            y_col     = "bw_mean",       # outcome     column
@@ -1393,17 +1411,17 @@ run_time_inter_analysis <-
            M_factors = 3L,              # # of latent factors in Stan
            nfold     = 5L,
            vb_draws  = 2000L,
-           seed      = 123,
-           d_inter_col = "pm25_lag") {
+           seed      = 123) {
   
   N_units <- nrow(data) / T_periods
+  stopifnot(nrow(W_units) == N_units)
   
-  ## Split variables -------------------------------------------
+  # Split variables -------------------------------------------
   X <- if (length(adj_cols)) data[, adj_cols, drop = FALSE] else NULL
   d <- data[[d_col]]
   y <- data[[y_col]]
 
-  ## Naive DML --------------------------------------------------------
+  # Obtain residuals and neighborhood mean ------------------------------------
   set.seed(seed)
   dml_fit <- dml_plm(X, d, y, dreg, yreg, nfold = nfold)
   
@@ -1413,45 +1431,47 @@ run_time_inter_analysis <-
     resY = dml_fit$resY,
     resD = dml_fit$resD
   )
+  
+  resD_mat <- matrix(dml_fit$resD, ncol = T_periods, byrow = TRUE)
+  resD_nei_mat  <- W_units %*% resD_mat # N by T of neighborhood effects
+  resD_nei_vec  <- as.vector(t(resD_nei_mat))
+  res_df$resD_nei <- resD_nei_vec
+  resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
+  
   res_df <- res_df |>
     dplyr::group_by(unit) |>
     dplyr::mutate(resD_lag = dplyr::lag(resD)) |>
     dplyr::ungroup() |>
     dplyr::filter(time > 1)
   
-  reg <- lm(resY ~ resD + resD_lag, data = res_df)
-
-  # Sandwich SEs
+  # Naive regression
+  reg <- lm(resY ~ resD + resD_lag + resD_nei, data = res_df)
   vcov_hc <- sandwich::vcovHC(reg, type = "HC3")
   reg_test <- lmtest::coeftest(reg, vcov. = vcov_hc)
   dml_summary <- broom::tidy(reg_test) %>%
-  dplyr::mutate(
-    ci_lower = estimate - 1.96 * std.error,
-    ci_upper = estimate + 1.96 * std.error
-    ) %>%
+    dplyr::mutate(
+      ci_lower = estimate - 1.96 * std.error,
+      ci_upper = estimate + 1.96 * std.error
+      ) %>%
     dplyr::select(term, estimate, std.error, ci_lower, ci_upper)
   
   # IFE
-  fe_fit <- interFE(resY ~ resD + resD_lag,
+  fe_fit <- interFE(resY ~ resD + resD_lag + resD_nei,
                     data  = as.data.frame(res_df),
                     index = c("unit", "time"),
                     r     = M_factors,
                     force = "none",
                     nboots = 200)
-  
-  ## Residuals to matrices -------------------------------------
-  resD_mat <- matrix(dml_fit$resD, ncol = T_periods, byrow = TRUE)
-  resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
 
-  ## Stan (Factor model VB) ------------------------------------
+  # Stan factor model ------------------------------------
   stan_data <- list(
     K = T_periods, Q = T_periods, N = N_units,
-    M = M_factors, d = resD_mat,  y = resY_mat
+    M = M_factors, d = resD_mat, d_nb = resD_nei_mat,  y = resY_mat
   )
-  sm_factor <- cmdstanr::cmdstan_model("stan/time_inter_factor.stan")
+  sm_factor <- cmdstanr::cmdstan_model("stan/spatiotemporal_inter_factor.stan")
   vb_fit <- sm_factor$variational(data = stan_data, seed = seed, draws = vb_draws)
   vb_summary <- posterior::summarise_draws(
-    vb_fit$draws(variables = c("beta0", "beta1", "beta2")),
+    vb_fit$draws(variables = c("beta1", "beta2", "beta3")),
     mean,
     ~quantile(.x, probs = c(0.025, 0.975))
     )
@@ -1461,16 +1481,16 @@ run_time_inter_analysis <-
 
   ## 1.6  Return --------------------------------------------
   result_df <- 
-    rbind(dml_summary[2:3,c(1:2,4:5)] %>% 
-            mutate(model = "DML (NUC)", term = c("Direct", "Lagged")),
-          vb_summary_df[2:3,] %>% 
-            mutate(model = "FC", term = c("Direct", "Lagged")),
+    rbind(dml_summary[2:4,c(1:2,4:5)] %>% 
+            mutate(model = "DML (NUC)", term = c("Direct", "Lag", "Neighbor")),
+          vb_summary_df[1:3,] %>% 
+            mutate(model = "FC", term = c("Direct", "Lag", "Neighbor")),
           fe_fit$est.table %>%
             as.data.frame() %>%
             tibble::rownames_to_column("term") %>%
-            filter(term %in% c("resD", "resD_lag")) %>%
+            filter(term %in% c("resD", "resD_lag", "resD_nei")) %>%
             mutate(
-              term = c("Direct", "Lagged"),
+              term = c("Direct", "Lag", "Neighbor"),
               model = "IFE"
             ) %>%
             dplyr::select(term, estimate = Coef, ci_lower = CI.lower, ci_upper = CI.upper, model)
@@ -1480,22 +1500,25 @@ run_time_inter_analysis <-
 ```
 
 ```{r}
-results_inter_all <- 
-  run_time_inter_analysis(merged_bw_df_selected,
+results_inter <- 
+  run_time_inter_analysis(merged_bw_df_selected, W_units,
                           adj_cols= colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)])
-results_inter_all <- results_inter_all %>% mutate(setting = "All covariates")
+results_inter$model <- factor(results_inter$model, levels = c("DML (NUC)", "IFE", "FC"))
 ```
 
 ```{r}
-ggplot(results_inter, aes(x = model, y = estimate, color = term, shape = term)) +
+p_inter <- ggplot(results_inter, aes(x = model, y = estimate, color = term, shape = term)) +
   geom_point(position = position_dodge(width = 0.5), size = 3) +
   geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
                 width = 0.2,
                 position = position_dodge(width = 0.5)) +
-  facet_wrap(~ setting, nrow = 1) +
-  labs(x = "Model", y = "Estimate", title = "Direct and Lagged Effects with 95% CI") +
+  # facet_wrap(~ setting, nrow = 1) +
+  labs(x = "Model", y = "Estimate", title = "Direct and Interference Effects") +
   theme_minimal() +
   theme(text = element_text(size = 12))
+
+# saveRDS(results_inter, file = "birthweight_interference.rds")
+# ggsave("bw_interference.pdf", p_inter, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
 ## Double negative control
