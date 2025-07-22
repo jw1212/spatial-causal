@@ -1,7 +1,7 @@
 ---
 title: "Birthweight Application"
 format: pdf
-editor: visual
+editor: source
 ---
 
 ```{r}
@@ -20,7 +20,7 @@ source("utilities.R")
 
 ```{r}
 # saveRDS(merged_bw_df_selected, file = "birthweight_data_preprocess.rds")
-merged_bw_df_selected <- readRDS("birthweight_data_preprocess.rds")
+merged_bw_df_selected <- readRDS("data/birthweight_data_preprocess.rds")
 raw_names <- colnames(merged_bw_df_selected)[11:35]
 colnames(merged_bw_df_selected)[11:35] <- paste0("x", 1:25)
 ```
@@ -67,8 +67,8 @@ run_analysis <- function(data,
   ci_95    <- coef_hat + c(-1.96, 1.96) * se_hat
 
   ## 1.3  Residuals to matrices -------------------------------------
-  resD_mat <- matrix(dml_fit$resD, ncol = T_periods, byrow = TRUE)
-  resY_mat <- matrix(dml_fit$resY, ncol = T_periods, byrow = TRUE)
+  resD_mat <- matrix(dml_fit$resD, ncol = 7, byrow = TRUE)
+  resY_mat <- matrix(dml_fit$resY, ncol = 7, byrow = TRUE)
 
   ## 1.4  Stan (Factor model VB) ------------------------------------
   N_units <- nrow(resD_mat)
@@ -238,7 +238,6 @@ plot_data$model <- factor(plot_data$model, levels = c("DML (NUC)", "IFE", "Facto
 
 plot_data |> group_by(setting, model) |>
   summarise(mean = mean(estimate), sd = sd(estimate), .groups = "drop") |>
-  filter(!is.na(sd)) |>
   arrange(setting, sd) |>
   ggplot() + geom_col(aes(x = setting, y = sd, fill = model), position="dodge") + theme_bw(base_size = 16) + ylab("Standard Deviation of Estimates") + 
   xlab("Covariates Included") + 
@@ -275,7 +274,9 @@ plot_data |> group_by(setting, model) |>
 
 p_rmse
 
-ggsave("sensitivity_rmse.png", width=6, height=6)
+(p_rmse + xlab(NULL) + theme(axis.text.x = element_blank())) / (p_sd + theme(legend.position = "none")) + plot_annotation(tag_levels = "A")
+
+ggsave("sd_rmse.png", width=6, height=10)
 
 plot_data |> group_by(setting, model) |>
   summarise(median = median(estimate), sd = sd(estimate), .groups = "drop") |>
@@ -303,7 +304,7 @@ p_combinations <- ggplot(plot_data,
   geom_point(position = position_dodge(width = .35),
              size = 2) +
   geom_hline(yintercept = 0, linetype = "dashed") +
-  labs(title = "Estimates by Number of Covariate Included",
+  labs(title = "",
        x = "Covariates Included",
        y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase",
        colour = "Model") +
@@ -317,6 +318,9 @@ p_combinations <- ggplot(plot_data,
         panel.grid.minor = element_blank())
 
 p_combinations
+
+
+
 
 
 # Create the beehive plot
@@ -334,7 +338,7 @@ p_beehive <- ggplot(plot_data,
   #              size = 3,
   #              shape = 18,  # diamond shape for means
   #              position = position_dodge(width = 0.7)) +
-  labs(title = "Sensitivity to Included Covariates",
+  labs(title = "",
        x = "Covariates Included",
        y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase",
        colour = "Model") +
@@ -353,6 +357,11 @@ p_beehive
 ggsave("beehive.png", width=6, height=6)
 
 library(patchwork)
+
+(p_beehive + (p_rmse + xlab(NULL) + theme(axis.text.x = element_blank()))) /
+(p_beehive + (p_sd + theme(legend.position = "none"))) + plot_annotation(tag_levels = "A")
+ggsave("birthweight_all_plots.png")
+
 p_beehive + (p_median / p_sd) + 
   plot_annotation(title = "Sensitivity to Included Covariates",
                   subtitle = "Beeswarm plot with median and standard deviation of estimates") &
@@ -360,214 +369,172 @@ p_beehive + (p_median / p_sd) +
         plot.subtitle = element_text(size = 16))
 ```
 
-```{r}
-results_raw <- run_analysis(merged_bw_df_selected)
-results_T <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[c(2,7)])
-results_S <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[4:5], seed = 111)
-results_X <- run_analysis(merged_bw_df_selected, adj_cols = colnames(merged_bw_df_selected)[11:35])
-results_ST <- run_analysis(merged_bw_df_selected, 
-                           adj_cols = colnames(merged_bw_df_selected)[c(2,4:5,7)])
-results_XT <- run_analysis(merged_bw_df_selected, 
-                           adj_cols = colnames(merged_bw_df_selected)[c(2,7,11:35)])
-results_XS <- run_analysis(merged_bw_df_selected, 
-                           adj_cols = colnames(merged_bw_df_selected)[c(4:5,11:35)])
-results_all <- run_analysis(merged_bw_df_selected, 
-                            adj_cols= colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)])
-```
-
-plot the estimate of omitting some covariates:
+## Nonlinear
 
 ```{r}
-omit_df <- tribble(
-  ~setting,                       ~model,               ~estimate, ~lwr, ~upr,
-  "No Adjustment",                "DML (NUC)",          -47.72,   -53.32, -42.12,
-  "No Adjustment",                "IFE",                -8.78,    -35.17,  15.99,
-  "No Adjustment",                "Factor Confounding", -9.284,   -13.7,   -4.67, 
-  "Spatial Only",                 "DML (NUC)",           4.34,    -3.36,   12.04,
-  "Spatial Only",                 "IFE",                 -15.30,  -37.87,  7.274,
-  "Spatial Only",                 "Factor Confounding", -8.498,   -15.16, -1.488,  
-  "Time-Varying Only",            "DML (NUC)",          -56.76,   -62.86, -50.659,
-  "Time-Varying Only",            "IFE",                 1.273,   -19.28, 15.51, 
-  "Time-Varying Only",            "Factor Confounding", -12.624,  -18.3, -6.7,
-  "Static Only",                  "DML (NUC)",          -7.4,     -13.356, -1.443,
-  "Static Only",                  "IFE",                -7.531,   -30.38, 8.883,
-  "Static Only",                  "Factor Confounding", -10.20,   -15.567, -4.553,
-  "Time-Varying + Spatial",       "DML (NUC)",          -24.45,   -36.01, -12.89,
-  "Time-Varying + Spatial",       "IFE",                -7.92,    -35.9,   21.94,
-  "Time-Varying + Spatial",       "Factor Confounding", -18.88,   -30.68, -6.32,
-  "Time-Varying + Spatial",       "Double NC",         -37.666,   -87.32, 1.199,
-  "Spatial + Static",             "DML (NUC)",          -3.44,    -10.96,  4.083,
-  "Spatial + Static",             "IFE",                -19.97,   -31.75,  9.74,
-  "Spatial + Static",             "Factor Confounding", -8.75,    -15.6,  -1.52,
-  "Spatial + Static",             "Double NC",         -25.10,    -65.71,  15.514,
-  "Time-Varying + Static",        "DML (NUC)",          -12.08,  -18.85,   -5.3,
-  "Time-Varying + Static",        "IFE",                -6.20,   -28.62,    8.57,
-  "Time-Varying + Static",        "Factor Confounding", -14.78,   -21.1, -8.08,
-  "All Confounders",              "DML (NUC)",          -11.98,   -21.96, -1.995,
-  "All Confounders",              "IFE",                -7.5,     -40.81, 16.35,
-  "All Confounders",              "Factor Confounding", -15.94,   -25.08, -6.33,
-  "All Confounders",              "Double NC",         -18.39,   -54.41, 17.62
-)
+adj_cols <- colnames(merged_bw_df_selected)[c(2, 4:5, 11:35)]
 
-# Preserve the logical order on the x‑axis
-omit_df$setting <- factor(omit_df$setting,
-  levels = c(
-    "No Adjustment",
-    "Spatial Only",
-    "Time-Varying Only",
-    "Static Only",
-    "Time-Varying + Spatial",
-    "Spatial + Static",
-    "Time-Varying + Static",
-    "All Confounders")
-)
-omit_df$model <- factor(omit_df$model, levels = c("DML (NUC)", "IFE", "Factor Confounding", "Double NC"))
+## 1.1 Prepare data for Stan model -------------------------------------------
+# Get covariates
+X <- merged_bw_df_selected[, adj_cols, drop = FALSE]
+d_raw <- merged_bw_df_selected[["pm25"]]
+y_raw <- merged_bw_df_selected[["bw_mean"]]
 
-# Plot: point estimate + 95% CI, one colour per model
-p_omit <- ggplot(omit_df,
-       aes(x = setting,
-           y = estimate,
-           colour = model #,shape  = model
-           )) +
-  geom_point(position = position_dodge(width = .35),
-             size = 2) +
-  geom_errorbar(aes(ymin = lwr, ymax = upr),
-                width = .15,
-                position = position_dodge(width = .35),
-                linewidth = .8) +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  labs(title = "Estimates Under Different Confounder Adjustments",
-       x = NULL,
-       y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase",
-       colour = "Model", shape = NULL) +
-  scale_colour_manual(values = c("DML (NUC)" = "#0072B2",
-                                 "Factor Confounding" = "firebrick",
-                                 "IFE" = "#009E73",
-                                 "Double NC" = "#D55E00")) +
-  # scale_shape_manual(values = c("DML naïve"          = 16,   # filled circle
-  #                               "Factor confounding" = 17)) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "top",
-        axis.text.x = element_text(angle = 30, hjust = 0.9),
-        panel.grid.minor = element_blank()
-        )
-p_omit
-# ggsave("bw_vary_adjustments_1.pdf", p_omit, width = 6.5, height = 5, units = "in", dpi = 300)
-```
+## 1.2 Reshape data to arrays for Stan -------------------------------------
+T_periods <- length(unique(merged_bw_df_selected$year))
+M_factors <- 3L
+num_knots <- 5
+num_knots_X <- 5
 
-## Double negative control
+N_units <- nrow(merged_bw_df_selected) / T_periods
 
-```{r}
-library(fixest)
-library(gmm)
-```
+# Reshape d and y to arrays: N_units x T_periods
+d_mat <- matrix(d_raw, ncol = T_periods, byrow = TRUE)
+y_mat <- matrix(y_raw, ncol = T_periods, byrow = TRUE)
 
-Use outcome in previous year and exposure in next year as negative controls.
+# Reshape X to array: N_units x P (take first row of each unit since X is time-invariant)
+X_mat <- X[seq(1, nrow(X), by = T_periods), ]
+P_covs <- ncol(X_mat)
 
-```{r}
-bw_panel <- merged_bw_df_selected %>% 
-  arrange(zip, year) %>%     # make time increasing within ZIP
-  group_by(zip) %>% 
-  mutate(
-    ## negative controls
-    bw_lag1     = lag(bw_mean, 1),   #  W_i   = Y_{i-1}
-    pm25_lead1  = lead(pm25, 1),     #  Z_i   = X_{i+1}
-    # ln_income   = log(median_income + 1),   # scale-robust
-    year_fe     = factor(year)              # year as factor
-  ) %>% 
-  ungroup() %>% 
-  drop_na(bw_lag1, pm25_lead1)        # first & last year of each ZIP lose 1 row
-```
+# Convert matrices to arrays for Stan
+d_array <- array(NA, dim = c(N_units, T_periods))
+y_array <- array(NA, dim = c(N_units, T_periods))
+X_array <- array(NA, dim = c(N_units, P_covs))
 
-```{r}
-rhs   <- paste(c("pm25", covars), collapse = " + ")
-fml   <- as.formula(
-  paste0("bw_mean ~ ", rhs, " | zip + year_fe")
-)
-
-ols_fe <- feols(fml, data = bw_panel, se = "cluster")
-# ols_fe <- feols(
-#   bw_mean ~ pm25 + median_income + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15 + x16 + x17 + x18 + x19 + x20 + x21 + x22 + x23 + x24 + x25 | zip + year_fe,
-#   data = bw_panel,
-#   se = "cluster"
-# )
-# etable(ols_fe, se.below = TRUE)
-coeftable(ols_fe)[c("pm25"), ]
-```
-
-```{r}
-nc_test <- feols(
-  bw_lag1 ~ pm25 + pm25_lead1 + median_income + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15 + x16 + x17 + x18 + x19 + x20 + x21 + x22 + x23 + x24 + x25 | zip + year_fe,
-  data = bw_panel,
-  se   = "cluster"
-)
-coeftable(nc_test)[c("pm25","pm25_lead1"), ]
-```
-
-```{r}
-# remove location and time fixed effect
-bw_panel_w <- bw_panel %>% 
-  group_by(zip) %>% 
-  mutate(across(c(bw_mean, pm25, bw_lag1, pm25_lead1, median_income, x1:x25), 
-                ~ .x - mean(.x, na.rm = TRUE))) %>%
-  ungroup() %>% 
-  group_by(year_fe) %>%     
-  mutate(across(c(bw_mean, pm25, bw_lag1, pm25_lead1, median_income, x1:x25), 
-                ~ .x - mean(.x, na.rm = TRUE))) %>%
-  ungroup()
-
-covars <- c("median_income")  #, paste0("x", 1:25)
-
-make_mom <- function(theta, d) {
-  kV      <- length(covars)          # 25 in your data
-  beta1   <- theta[kV + 3]           # last element of theta
-
-  ## theta layout:
-  ##   [1]     γ0
-  ##   [2]     γ2  (coefficient on W)
-  ##   [3:(kV+2)] γ_V (25 covariate terms)
-  ##   [kV+3] β1  (== γ1, coefficient on X)
-
-  gamma_vec <- c(
-    theta[1],        # γ0
-    beta1,           # γ1  (== β1)
-    theta[2:(kV+2)]  # γ2 and γ_V
-  )
-
-  X  <- d$pm25
-  W  <- d$bw_lag1
-  V  <- as.matrix(d[, covars])
-  Z  <- d$pm25_lead1
-  Y <- d$bw_mean
-
-  Bmat <- cbind(1, X, W, V)          # n × (kV+3)
-  Qmat <- cbind(1, X, Z, V)          # n × (kV+3)
-
-  resid <- Y - drop(Bmat %*% gamma_vec) # n-vector
-  m <- resid * Qmat 
-  m                        # n × (3+kV)
+for(n in 1:N_units) {
+  d_array[n, ] <- d_mat[n, ]
+  y_array[n, ] <- y_mat[n, ]
+  X_array[n, ] <- as.numeric(X_mat[n, ])
 }
 
-theta0 <- rep(0, 2 + length(covars) + 1)   # γ0 γ2 γ_V … β1
-names(theta0) <- c(
-  "gamma0",
-  "gamma2",
-  paste0("gamma_", covars),
-  "beta1"
-)
-gmm_fit <- gmm(
-  g        = make_mom,
-  x        = bw_panel, # bw_panel_w
-  t0       = theta0,
-  type     = "twoStep",
-  vcov     = "HAC",      # now safe: every column has variance
-  prewhite = FALSE
+# Create knot matrices
+knots_d <- seq(min(d_raw), max(d_raw), length.out = num_knots)
+knots_X <- matrix(NA, nrow = P_covs, ncol = num_knots_X)
+for(p in 1:P_covs) {
+  knots_X[p, ] <- seq(min(X_mat[, p]), max(X_mat[, p]), length.out = num_knots_X)
+}
+
+## 1.3 Stan data list ------------------------------------
+stan_data <- list(
+  K = T_periods, 
+  Q = T_periods, 
+  N = N_units,
+  M = M_factors, 
+  P = P_covs,
+  num_knots = num_knots,
+  num_knots_X = num_knots_X,
+  d = d_array,  
+  y = y_array,
+  X = X_array,
+  knots = knots_d,
+  knots_X = knots_X
 )
 
-beta_tab <- summary(gmm_fit)$coefficients["beta1", ]
-beta_tab
-beta_hat <- beta_tab["Estimate"]
-se_hat   <- beta_tab["Std. Error"]
-ci_95    <- beta_hat + qnorm(c(.025, .975)) * se_hat
-ci_95
+## 1.4 Fit Stan model ------------------------------------
+sm_factor <- cmdstanr::cmdstan_model("stan/time_nc_factor_nonlinear.stan")
+vb_fit <- sm_factor$variational(data = stan_data, seed = 1234, draws = 2000)
+saveRDS(vb_fit, file = "vb_fit_nonlinear.RDS")
+## 1.5 Extract and plot spline effects ------------------------------------
+
+# Extract treatment spline coefficients (now just a single vector)
+spline_coefs_draws <- posterior::as_draws_df(vb_fit$draws("spline_coefs"))
+spline_coefs_summary <- posterior::summarise_draws(spline_coefs_draws)
+
+# Get mean coefficients for plotting (now just a vector, not matrix)
+spline_coefs_mean <- spline_coefs_summary$mean
+
+# Function to evaluate B-spline basis (matching your Stan code)
+eval_bspline_basis <- function(x, knots) {
+  num_knots <- length(knots)
+  basis <- rep(0, num_knots)
+  
+  for(j in 1:num_knots) {
+    dist <- abs(x - knots[j])
+    if(dist <= 1.0) {
+      if(dist <= 0.5) {
+        basis[j] <- 1 - 2 * dist^2
+      } else {
+        basis[j] <- 2 * (1 - dist)^2
+      }
+    }
+  }
+  return(basis)
+}
+
+# Function to evaluate spline effect
+eval_spline_effect <- function(x, spline_coefs, knots) {
+  basis <- eval_bspline_basis(x, knots)
+  return(sum(spline_coefs * basis))
+}
+
+# Create evaluation grid
+d_range <- range(stan_data$d)
+d_grid <- seq(d_range[1], d_range[2], length.out = 100)
+
+# Evaluate treatment splines (same for all time periods now)
+spline_values <- sapply(d_grid, function(x) {
+  eval_spline_effect(x, spline_coefs_mean, stan_data$knots)
+})
+
+plot_data_treatment <- tibble(
+  treatment_value = d_grid,
+  spline_effect = spline_values
+)
+
+# Plot treatment spline effects
+p_spline_treatment <- ggplot(plot_data_treatment, aes(x = treatment_value, y = spline_effect)) +
+  geom_line(size = 1) +
+  geom_vline(xintercept = stan_data$knots, linetype = "dashed", alpha = 0.5) +
+  labs(
+    title = "Nonlinear Treatment Effects (PM2.5)",
+    x = "PM2.5 Level", 
+    y = "Spline Effect"
+  ) +
+  theme_bw()
+
+p_spline_treatment
+
+## 1.6 Extract and plot covariate spline effects ------------------------------------
+
+# Extract covariate spline coefficients for Y model (now P x num_knots_X matrix)
+spline_coefs_X_y_draws <- posterior::as_draws_df(vb_fit$draws("spline_coefs_X_y"))
+spline_coefs_X_y_summary <- posterior::summarise_draws(spline_coefs_X_y_draws)
+
+# Reshape to matrix: P x num_knots_X
+spline_coefs_X_y_mean <- matrix(spline_coefs_X_y_summary$mean, nrow = P_covs, ncol = num_knots_X, byrow = TRUE)
+
+# Plot a few covariate effects (first few covariates)
+plot_data_covariates <- tibble()
+
+for(p in 1:min(4, P_covs)) {  # Plot first 4 covariates
+  # Create evaluation grid for this covariate
+  x_range <- range(X_array[, p])
+  x_grid <- seq(x_range[1], x_range[2], length.out = 100)
+  
+  spline_values <- sapply(x_grid, function(x) {
+    eval_spline_effect(x, spline_coefs_X_y_mean[p, ], knots_X[p, ])
+  })
+  
+  plot_data_covariates <- bind_rows(
+    plot_data_covariates,
+    tibble(
+      covariate_value = x_grid,
+      spline_effect = spline_values,
+      covariate = paste0("Covariate_", p)
+    )
+  )
+}
+
+# Plot covariate spline effects
+p_spline_covariates <- ggplot(plot_data_covariates, aes(x = covariate_value, y = spline_effect)) +
+  geom_line(size = 1) +
+  facet_wrap(~covariate, scales = "free") +
+  labs(
+    title = "Nonlinear Covariate Effects (same for all outcomes)",
+    x = "Covariate Value", 
+    y = "Spline Effect"
+  ) +
+  theme_bw()
+
+p_spline_covariates
 ```
