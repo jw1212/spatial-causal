@@ -1637,3 +1637,406 @@ ci_95    <- beta_hat + qnorm(c(.025, .975)) * se_hat
 ci_95
 ```
 
+## Nonlinear Effect
+
+```{r}
+fit_plr_one_year <- function(data, t, x_base) {
+
+  # ----- outcome & (non‑)linear parts ---------------------------------
+  y_col        <- paste0("bw_mean_", t)
+  d_cols       <- paste0("pm25_", setdiff(2018:2024, t))           # linear
+  x_cols       <- c(paste0("pm25_", t), unlist(lapply(x_base, \(x) paste0(x, "_", t))))
+
+  dml_data <- DoubleMLData$new(
+    as.data.table(data[, c(y_col, d_cols, x_cols)]),
+    y_col = y_col,
+    d_cols = d_cols,
+    x_cols = x_cols
+  )
+
+  # ----- machine‑learning learners for g(·) and m(·) ------------------
+  lrn_rf <- lrn("regr.ranger", num.trees = 300, respect.unordered.factors = "partition")
+  # same learner for both parts
+  plr    <- DoubleMLPLR$new(dml_data, ml_l = lrn_rf$clone(),
+                            ml_m = lrn_rf$clone())
+
+  plr$fit()
+  # return tidy result
+  tibble(year = t,
+         exposure_other = d_cols,
+         coef  = plr$coef)
+}
+```
+
+```{r}
+# first regress Y_it on D_it and X_it to get residuals
+years <- 2018:2024
+x_names <- colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)]
+wide_bw_df <- merged_bw_df_selected |>
+  pivot_wider(
+    id_cols   = zip,          # one observation = one location
+    names_from = year,             # 1 … 7
+    values_from = c(bw_mean, pm25, x_names)  # outcome, exposure, covariates
+  )
+
+M = 3
+plm_results <- map_dfr(2018:2024, ~fit_plr_one_year(data = wide_bw_df, 
+                                                    t = .x, x_base = x_names))
+C_hat <- matrix(0, 7, 7)
+off_diag_idx <- which(row(C_hat) != col(C_hat), arr.ind = TRUE)
+C_hat[off_diag_idx] <- plm_results$coef
+C_hat <- t(C_hat)
+C_off <- C_hat  # store for Procrustes
+
+# -------------------------------------------
+# 2. Factor model on residuals and pinpoint C
+x <- merged_bw_df_selected[, c(2,4:5,7,11:35)]
+d <- merged_bw_df_selected[,]$pm25
+y <- merged_bw_df_selected[,]$bw_mean
+dml_rf = dml_plm(x, d, y, dreg, yreg, nfold=5)
+resD <- dml_rf$resD
+resY <- dml_rf$resY
+
+resY_mat <- t(matrix(resY, nrow=7))
+resD_mat <- t(matrix(resD, nrow=7))
+
+fa_res <- factanal(resD_mat, factors = 3)
+A_hat <- as.matrix(fa_res$loadings)     # d × M
+sds   <- apply(resD_mat, 2, sd)       # standard deviations of columns
+A_hat <- A_hat * sds                 # scale loadings back to original scale
+psi_raw <- fa_res$uniquenesses         # vector of length d
+Psi_cov <- diag(psi_raw * sds^2)        # scale to original variance scale
+Sigma_D_hat <- A_hat %*% t(A_hat) + Psi_cov  
+
+fa_resY <- factanal(resY_mat, M) # fa(resD_mat, nfactors = M, rotate = "none", scores = "regression")
+Gamma_hat <- as.matrix(fa_resY$loadings)   # d × M
+Gamma_hat <- Gamma_hat * sqrt(diag(cov(resY_mat)))         
+
+Sigma_VD_hat <- diag(3) - t(A_hat) %*% solve(cov(resD_mat)) %*% A_hat
+Sigma_VD_hat <- (Sigma_VD_hat + t(Sigma_VD_hat))/2   # numerical stabilisation
+Sigma_VD_hat <- Sigma_VD_hat + 1e-8 * diag(3)
+
+inv_sqrt_Sigma_VD <- expm::sqrtm(solve(Sigma_VD_hat))
+R_hat  <- inv_sqrt_Sigma_VD %*% t(A_hat) %*% solve(cov(resD_mat))
+
+# Optimize on the Stiefel manifold
+# -------- objective:  ‖  W*(Γ Θ R − C_off) ‖_F²  --------------------
+Wmat <- matrix(1, 7, 7); diag(Wmat) <- 0
+obj_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat          # d × d
+  diff  <- (Mtmp - C_off) * Wmat                  # mask diag
+  sum(diff * diff)                                # Frobenius²
+}
+
+# gradient 
+grad_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat
+  diff  <- (Mtmp - C_off) * Wmat                  # d × d
+  2 * ( t(Gamma_hat) %*% diff %*% t(R_hat) )      # M × M
+}
+
+set.seed(111)
+best_obj <- Inf
+Theta_hat <- NULL
+n_starts <- 10  # try 5-20 for stability
+for (i in 1:n_starts) {
+  Theta_init <- rustiefel(M, M) 
+  current_result <- optStiefel(F = obj_fn,
+                          dF = grad_fn,
+                          Vinit = Theta_init, 
+                          # method="curvilinear",
+                          maxIters = 100,
+                          maxLineSearchIters = 100,
+                          tol = 1e-10,
+                          verbose = TRUE) # M × M orthogonal
+  current_obj <- obj_fn(current_result)
+  if (current_obj < best_obj) {
+    best_obj <- current_obj
+    Theta_hat <- current_result
+  }
+}
+
+# --------- recovered bias matrix ------------------------------------
+C_hat <- Gamma_hat %*% Theta_hat %*% R_hat
+C_hat1 <- C_off
+diag(C_hat1) <- diag(C_hat)
+print(round(C_hat1, 3))
+print(round(C_hat, 3))
+
+# -------------------------------------------
+# 3.  Debias Y and estimate g_j(d)
+Y_db <- as.matrix(wide_bw_df[paste0("bw_mean_", years)]) -
+        resD_mat %*% t(C_hat1)
+
+# Dose–response at mean X  (we ignore X to mimic "average over X")
+
+df <- data.frame(y = as.vector(t(Y_db)),
+                 d = merged_bw_df_selected[,]$pm25)
+df <- cbind(df, x)
+x_terms <- paste(colnames(x), collapse = " + ")
+form    <- as.formula(paste("y ~ s(d, k = 10) +", x_terms))
+g_fit <- gam(form, data = df, method = "REML")
+
+d_grid <- seq(5, 20, length = 200)
+x_bar <- colMeans(x)
+x_bar <- 0
+g_hat <- predict(g_fit, 
+                 newdata = data.frame(
+                   d = d_grid,
+                   t(x_bar))
+)
+plot_df <- data.frame(
+  d       = d_grid,
+  g       = g_hat
+)
+
+p_nonlinear <- ggplot(plot_df, aes(d, g)) +
+  geom_line(size = 1) +
+  labs(x = "d", y = expression(g(d))) +
+  theme_minimal()
+
+ggsave("birthweight_nonlinear.pdf", p_nonlinear, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+Second estimator.
+```{r}
+make_panel_arrays <- function(df, covar_cols = default_covars, years_allowed = 2018:2024,
+                              K_expected = 7L) {
+  df <- df %>%
+    filter(.data$year %in% years_allowed) %>%
+    arrange(.data$zip, .data$year)
+
+  yrs <- sort(unique(df$year))
+  K <- length(yrs)
+  if (K != K_expected) warning("Found ", K, " distinct years; expected ", K_expected)
+
+  # keep covariates present in data
+  covar_cols <- covar_cols[covar_cols %in% names(df)]
+  P_x <- length(covar_cols)
+  message("Using ", P_x, " covariates: ", paste(covar_cols, collapse = ", "))
+
+  # keep zips with complete K rows
+  zips_complete <- df %>% count(zip, name = "n") %>% filter(n == K) %>% pull(zip)
+  dfc <- df %>% filter(zip %in% zips_complete)
+  zips <- sort(unique(dfc$zip))
+  N <- length(zips)
+  message("ZIPs with complete records: ", N)
+
+  d_mat <- matrix(NA_real_, N, K)
+  y_mat <- matrix(NA_real_, N, K)
+  X_array <- array(0, dim = c(N, K, P_x))
+
+  for (i in seq_len(N)) {
+    sub <- dfc %>% filter(zip == zips[i]) %>% arrange(match(year, yrs))
+    d_mat[i, ] <- sub$pm25
+    y_mat[i, ] <- sub$bw_mean
+    if (P_x > 0) X_array[i, , ] <- as.matrix(sub[, covar_cols])
+  }
+
+  list(
+    zips = zips, years = yrs,
+    d_mat = d_mat, y_mat = y_mat, X_array = X_array,
+    P_x = P_x, N = N, K = K
+  )
+}
+
+fit_zip_year_te <- function(df, covar_cols = default_covars,
+                            M = 3L, L = 8L, degree = 3L,
+                            years_allowed = 2018:2024, K_expected = 7L,
+                            stan_path = "stan/nonlinear_factor.stan",
+                            iter = 6000, output_samples = 2000, seed = 123) {
+
+  pan <- make_panel_arrays(df, covar_cols, years_allowed, K_expected)
+
+  # Build bases on N × K matrix (ZIP × year)
+  bases <- build_bases(pan$d_mat, L = L, degree = degree)
+
+  d_arr <- lapply(seq_len(pan$N), function(i) as.vector(bases$z_mat[i, ]))
+  y_arr <- lapply(seq_len(pan$N), function(i) as.vector(pan$y_mat[i, ]))
+  X_list <- if (pan$P_x > 0) {
+    lapply(seq_len(pan$N), function(i) {
+      matrix(pan$X_array[i, , ], nrow = pan$K)
+    })
+  } else {
+    lapply(seq_len(pan$N), function(i) {
+      matrix(0, pan$K, 0)
+    })
+  }
+
+  data_list <- list(
+    K = pan$K, N = pan$N, M = M,
+    d = d_arr, y = y_arr,
+    P_x = pan$P_x, X = X_list,
+    L = L, B = lapply(seq_len(pan$K), function(k) bases$B_list[[k]])
+  )
+
+  sm <- cmdstanr::cmdstan_model(stan_path)
+  fit <- sm$variational(
+    data = data_list,
+    seed = seed,
+    iter = iter,
+    output_samples = output_samples,
+    adapt_engaged = TRUE,
+    adapt_iter = 200
+  )
+  draws <- fit$draws() 
+
+  list(
+    pan = pan,
+    aux = list(d_mean = bases$d_mean, d_sd = bases$d_sd, 
+               knot_info = bases$knot_info, col_means = bases$col_means),
+    fit = fit, draws = draws,
+    config = list(M = M, L = L, degree = degree, vi_iter = iter, 
+                  vi_output_samples = output_samples)
+  )
+}
+
+# ---------- Post-fit: effect summaries and plots -------------------------
+# extract_beta_theta <- function(mle) {
+#   beta_lin <- as.numeric(mle["beta_lin"])
+#   theta <- as.numeric(mle[grep("^theta\\[", names(mle))])
+#   list(beta_lin = beta_lin, theta = theta)
+# }
+# 
+# plot_dose_response <- function(result, Delta = 1.0) {
+#   beta <- extract_beta_theta(result$mle)
+#   d_all <- as.numeric(result$pan$d_mat)
+#   d_grid <- seq(min(d_all), max(d_all), length.out = 400)
+# 
+#   f_hat <- f_causal(d_grid, beta$beta_lin, beta$theta, result$aux)
+#   f_hat_center <- f_hat - f_causal(mean(d_all), beta$beta_lin, beta$theta, result$aux)
+# 
+#   te_hat <- te_point(d_grid, beta$beta_lin, beta$theta, result$aux)
+#   acd <- average_causal_derivative(result$pan$d_mat, beta$beta_lin, beta$theta, result$aux)
+#   ate_D <- average_shift_effect(result$pan$d_mat, Delta, beta$beta_lin, beta$theta, result$aux)
+# 
+#   old_par <- par(mfrow = c(1, 2))
+#   on.exit(par(old_par), add = TRUE)
+# 
+#   plot(d_grid, f_hat_center, type = "l", lwd = 2,
+#        xlab = "PM2.5 (µg/m³)", ylab = "f(d) − f(d̄)",
+#        main = "Estimated causal dose–response")
+#   abline(h = 0, lty = 3)
+# 
+#   plot(d_grid, te_hat, type = "l", lwd = 2,
+#        xlab = "PM2.5 (µg/m³)", ylab = "Marginal effect dY/dD",
+#        main = sprintf("Marginal TE; ACD = %.3f, ATE(+%.1f) = %.3f", acd, Delta, ate_D))
+#   abline(h = 0, lty = 3)
+# 
+#   invisible(list(acd = acd, ate = ate_D))
+# }
+
+# Compute ribbons for dose–response f(d) and TE(d)
+summarize_effect_curves <- function(result, Delta = 1.0,
+                                    d_grid = NULL,
+                                    probs = c(0.025, 0.5, 0.975)) {
+  draws <- as_draws_matrix(result$draws)
+  aux <- result$aux
+
+  if (is.null(d_grid)) {
+    d_all <- as.numeric(result$pan$d_mat)
+    d_grid <- seq(quantile(d_all, 0.01), quantile(d_all, 0.99), length.out = 300)
+  }
+
+  # Extract beta_lin and theta draws
+  beta_lin <- draws[, "beta_lin"]
+  theta_cols <- grep("^theta\\[", colnames(draws))
+  theta_mat <- as.matrix(draws[, theta_cols, drop = FALSE])  # S x L
+
+  S <- nrow(theta_mat)
+  G <- length(d_grid)
+
+  # f(d) for each draw
+  f_mat <- matrix(NA_real_, G, S)
+  te_mat <- matrix(NA_real_, G, S)
+  for (s in 1:S) {
+    f_mat[, s] <- f_causal(d_grid, beta_lin[s], theta_mat[s, ], aux)
+    te_mat[, s] <- te_point(d_grid, beta_lin[s], theta_mat[s, ], aux)
+  }
+
+  # Center dose–response at mean(D) for comparability
+  d_bar <- mean(as.numeric(result$pan$d_mat))
+  f_bar <- sapply(1:S, function(s) f_causal(d_bar, beta_lin[s], theta_mat[s, ], aux))
+  f_mat_center <- sweep(f_mat, 2, f_bar, "-")
+
+  f_q <- apply(f_mat_center, 1, quantile, probs = probs)
+  te_q <- apply(te_mat, 1, quantile, probs = probs)
+
+  # ACD and ATE(Delta)
+  d_all <- as.numeric(result$pan$d_mat)
+  acd_draws <- vapply(1:S, function(s)
+    mean(te_point(d_all, beta_lin[s], theta_mat[s, ], aux)), numeric(1))
+
+  ate_draws <- vapply(1:S, function(s)
+    mean(delta_effect_vec(d_all, Delta, beta_lin[s], theta_mat[s, ], aux)), numeric(1))
+
+  list(
+    dose_df = data.frame(
+      d = d_grid,
+      lo = f_q[1,], med = f_q[2,], hi = f_q[3,]
+    ),
+    te_df = data.frame(
+      d = d_grid,
+      lo = te_q[1,], med = te_q[2,], hi = te_q[3,]
+    ),
+    acd = quantile(acd_draws, probs = probs),
+    ate = quantile(ate_draws, probs = probs),
+    probs = probs
+  )
+}
+
+plot_effects_vi_gg <- function(sumres, Delta = 1.0,
+                               title_prefix = "PM2.5 on Birthweight",
+                               units_x = "PM2.5 (µg/m³)") {
+
+  acd_txt <- sprintf("ACD = %.3f [%.3f, %.3f]",
+                     sumres$acd[2], sumres$acd[1], sumres$acd[3])
+  ate_txt <- sprintf("ATE(+%.1f) = %.3f [%.3f, %.3f]",
+                     Delta, sumres$ate[2], sumres$ate[1], sumres$ate[3])
+
+  p1 <- ggplot(sumres$dose_df, aes(d, med)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    labs(x = units_x, y = expression( f(d) - f(bar(d)) ),
+         title = paste0(title_prefix, ": Causal dose–response"),
+         subtitle = "Centered at sample mean exposure") +
+    theme_minimal(base_size = 12)
+
+  p2 <- ggplot(sumres$te_df, aes(d, med)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    labs(x = units_x, y = "Marginal effect  dY/dD",
+         title = paste0(title_prefix, ": Marginal effect"),
+         subtitle = paste(acd_txt, " · ", ate_txt)) +
+    theme_minimal(base_size = 12)
+
+  list(p_dose = p1, p_te = p2)
+}
+```
+
+```{r}
+# Fit with VI
+res_vi <- fit_zip_year_te(
+  merged_bw_df_selected,
+  covar_cols = colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)], 
+  M = 3L, L = 6L, degree = 3L
+)
+# saveRDS(res_vi, file = "bw_nonlinear_results.rds")
+
+# Summarize on a +1 µg/m³ shift
+sumres <- summarize_effect_curves(res_vi, Delta = 1.0, probs = c(0.025, 0.5, 0.975))
+# saveRDS(sumres, file = "bw_nonlinear_estimated_effects.rds")
+
+# Plot ribbons
+plots <- plot_effects_vi_gg(sumres, Delta = 1.0)
+plots$p_dose
+plots$p_te
+
+# Print numeric summaries
+sumres$acd   # 2.5%, 50%, 97.5% for average causal derivative
+sumres$ate   # 2.5%, 50%, 97.5% for average shift by +1
+```
+
+

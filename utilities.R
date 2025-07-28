@@ -283,3 +283,133 @@ format.perc <- function(probs, digits) {
                digits = digits),
         "%")
 }
+
+## Build splines
+make_knots <- function(z_all, L, degree = 3, boundary_expand = 0.01) {
+  n_int <- max(L - (degree + 1), 0)
+  probs <- if (n_int > 0) (1:n_int) / (n_int + 1) else numeric(0)
+  internal <- if (n_int > 0) as.numeric(quantile(z_all, probs)) else numeric(0)
+  rng <- range(z_all, finite = TRUE)
+  pad <- diff(rng) * boundary_expand
+  list(internal = internal,
+       Boundary.knots = c(rng[1] - pad, rng[2] + pad),
+       degree = degree)
+}
+
+build_bases <- function(d_mat, L, degree = 3) {
+  d_mean <- mean(d_mat); d_sd <- sd(as.numeric(d_mat))
+  z_mat  <- (d_mat - d_mean) / d_sd
+  z_all  <- as.numeric(z_mat)
+  
+  knot_info <- make_knots(z_all, L, degree)
+  B_pool <- bSpline(
+    z_all, knots = knot_info$internal, degree = degree,
+    Boundary.knots = knot_info$Boundary.knots, intercept = TRUE
+  )
+  col_means <- colMeans(B_pool)
+  
+  N <- nrow(d_mat); K <- ncol(d_mat)
+  B_list <- vector("list", K)
+  for (k in 1:K) {
+    Bk_unc <- bSpline(
+      z_mat[, k],
+      knots = knot_info$internal, degree = degree,
+      Boundary.knots = knot_info$Boundary.knots, intercept = TRUE
+    )
+    B_list[[k]] <- sweep(Bk_unc, 2, col_means, "-")
+  }
+  
+  list(
+    z_mat = z_mat,
+    d_mean = d_mean, d_sd = d_sd,
+    B_list = B_list,
+    knot_info = knot_info,
+    col_means = col_means
+  )
+}
+
+# ---------- Recover treatment effects ----------
+# ----- Pointwise causal component on original d-scale -----
+# f(d) = beta_lin * z + theta' B_centered(z)
+f_causal <- function(d_vec, beta_lin, theta, aux) {
+  z <- (d_vec - aux$d_mean) / aux$d_sd
+  # uncentered basis
+  B_raw <- bSpline(
+    z,
+    knots = aux$knot_info$internal,
+    degree = aux$knot_info$degree,
+    Boundary.knots = aux$knot_info$Boundary.knots,
+    intercept = TRUE
+  )
+  # center columns same as training
+  Bc <- sweep(B_raw, 2, aux$col_means, "-")
+  L_basis <- ncol(Bc)
+  if (length(theta) < L_basis) stop("theta length < basis columns: ",
+                                    length(theta), " vs ", L_basis)
+  if (length(theta) > L_basis) theta <- theta[seq_len(L_basis)]
+  as.numeric(beta_lin * z + as.vector(Bc %*% as.numeric(theta)))
+}
+
+# ----- Pointwise marginal derivative (ACD integrand) on original d-scale -----
+# TE(d) = (beta_lin + theta' B'(z)) / sd
+te_point <- function(d_vec, beta_lin, theta, aux) {
+  z <- (d_vec - aux$d_mean) / aux$d_sd
+  Bprime <- dbs(
+    z,
+    knots = aux$knot_info$internal,
+    degree = aux$knot_info$degree,
+    Boundary.knots = aux$knot_info$Boundary.knots,
+    intercept = TRUE
+  )
+  L_basis <- ncol(Bprime)
+  if (length(theta) < L_basis) stop("theta length < basis columns: ",
+                                    length(theta), " vs ", L_basis)
+  if (length(theta) > L_basis) theta <- theta[seq_len(L_basis)]
+  as.numeric(beta_lin + as.vector(Bprime %*% as.numeric(theta))) / aux$d_sd
+}
+
+# ----- Finite-change effect for a shift Delta -----
+# ΔY(d;Δ) = f(d+Δ) - f(d)
+# Efficiently exploits that z1 - z0 = Δ / sd and uses centered bases.
+delta_effect_vec <- function(d_vec, Delta, beta_lin, theta, aux) {
+  z0 <- (d_vec - aux$d_mean) / aux$d_sd
+  z1 <- z0 + Delta / aux$d_sd
+  
+  B0_raw <- bSpline(
+    z0,
+    knots = aux$knot_info$internal,
+    degree = aux$knot_info$degree,
+    Boundary.knots = aux$knot_info$Boundary.knots,
+    intercept = TRUE
+  )
+  B1_raw <- bSpline(
+    z1,
+    knots = aux$knot_info$internal,
+    degree = aux$knot_info$degree,
+    Boundary.knots = aux$knot_info$Boundary.knots,
+    intercept = TRUE
+  )
+  
+  B0c <- sweep(B0_raw, 2, aux$col_means, "-")
+  B1c <- sweep(B1_raw, 2, aux$col_means, "-")
+  L_basis <- ncol(B0c)
+  if (length(theta) < L_basis) stop("theta length < basis columns: ",
+                                    length(theta), " vs ", L_basis)
+  if (length(theta) > L_basis) theta <- theta[seq_len(L_basis)]
+  
+  lin <- beta_lin * (Delta / aux$d_sd)
+  nl  <- as.numeric((B1c - B0c) %*% as.numeric(theta))
+  lin + nl
+}
+
+# ===== High-level wrappers =====
+
+# Average causal derivative over the empirical D
+average_causal_derivative <- function(d_mat, beta_lin, theta, aux) {
+  mean(te_point(as.numeric(d_mat), beta_lin, theta, aux))
+}
+
+# Average finite change for shift Delta
+average_shift_effect <- function(d_mat, Delta, beta_lin, theta, aux) {
+  mean(delta_effect_vec(as.numeric(d_mat), Delta, beta_lin, theta, aux))
+}
