@@ -1487,15 +1487,15 @@ results_inter_all <- results_inter_all %>% mutate(setting = "All covariates")
 ```
 
 ```{r}
-ggplot(results_inter, aes(x = model, y = estimate, color = term, shape = term)) +
+ggplot(results_inter |> filter(setting == "All covariates"), aes(x = model, y = estimate*10, color = term, shape = term)) +
   geom_point(position = position_dodge(width = 0.5), size = 3) +
-  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+  geom_errorbar(aes(ymin = 10*ci_lower, ymax = 10*ci_upper),
                 width = 0.2,
                 position = position_dodge(width = 0.5)) +
-  facet_wrap(~ setting, nrow = 1) +
-  labs(x = "Model", y = "Estimate", title = "Direct and Lagged Effects with 95% CI") +
-  theme_minimal() +
-  theme(text = element_text(size = 12))
+#  facet_wrap(~ setting, nrow = 1) +
+  labs(x = "Model", y = "Birthweight change (g)\nper 10 µg/m³ PM2.5 increase", title = "Direct and Lagged Effects with 95% CI") +
+  theme_bw(base_size=16) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red")  
 ```
 
 ## Double negative control
