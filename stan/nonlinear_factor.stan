@@ -70,15 +70,15 @@ model {
   // Priors
   to_vector(A)       ~ normal(0, 1);
   to_vector(gamma)   ~ normal(0, 1);
-  alpha_d            ~ normal(0, 2);
+  alpha_d            ~ normal(0, 5);
   alpha_y            ~ normal(0, 10);
   B_Xd               ~ normal(0, 1);
-  B_Xy               ~ normal(0, 1);
+  B_Xy               ~ normal(0, 2);
   beta_lin           ~ normal(0, 5);
   theta              ~ normal(0, tau_theta);
-  tau_theta          ~ normal(0, 1);
+  tau_theta          ~ normal(0, 5);
   sigma_d            ~ std_normal();
-  sigma_y            ~ normal(0, 5);
+  sigma_y            ~ normal(0, 2);
 
   // bias mapping
   matrix[K, K] G;
@@ -109,5 +109,5 @@ model {
   y ~ multi_normal_prec(mu, Sigma2_inv);
 }
 generated quantities {
-  // space for posterior predictions if you switch to sampling / laplace
+  // space for posterior predictions 
 }

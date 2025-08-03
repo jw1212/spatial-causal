@@ -1798,7 +1798,98 @@ p_nonlinear <- ggplot(plot_df, aes(d, g)) +
 ggsave("birthweight_nonlinear.pdf", p_nonlinear, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
-Second estimator.
+### Second estimator
+
+Covariate selection.
+```{r}
+merged_bw_df_selected <- 
+  merged_bw_df_selected[, !(names(merged_bw_df_selected) %in% 
+                              c("total_birth", "bw_prop_low", "bw_var"))]
+
+feature_cols <- colnames(merged_bw_df_selected)[c(2:4,6,8:32)]
+rf_fit_y <- ranger(
+  bw_mean ~ ., data = merged_bw_df_selected[, c("bw_mean", feature_cols)],
+  num.trees = 500, mtry = sqrt(length(feature_cols)),
+  importance = "permutation"
+)
+imp_tbl_y <- data.frame(var = names(rf_fit_y$variable.importance),
+                        value = rf_fit_y$variable.importance) %>%
+  arrange(desc(value))
+
+rf_fit_d <- ranger(
+  pm25 ~ ., data = merged_bw_df_selected[, c("pm25", feature_cols)],
+  num.trees = 500, mtry = sqrt(length(feature_cols)),
+  importance = "permutation"
+)
+imp_tbl_d <- data.frame(var = names(rf_fit_d$variable.importance),
+                        value = rf_fit_d$variable.importance) %>%
+  arrange(desc(value))
+
+top_vars_y <- imp_tbl_y$var[imp_tbl_y$value > quantile(imp_tbl_y$value, 0.2)]
+top_vars_d <- imp_tbl_d$var[imp_tbl_d$value > quantile(imp_tbl_d$value, 0.2)]
+
+covars_selected <- intersect(top_vars_y, top_vars_d)
+```
+
+Covariates transformation.
+```{r}
+expand_covars <- function(df, base_cols,
+                          spline_df     = 4,
+                          alpha_lasso   = 1,
+                          interact      = TRUE,
+                          center_scale  = TRUE) {
+
+  out <- df
+
+  ## B-spline basis (natural cubic, no intercept)
+  for (c in base_cols) {
+    bs_mat <- splines2::bSpline(df[[c]], df = spline_df, degree = 3,
+                                intercept = FALSE)
+    colnames(bs_mat) <- paste0(c, "_bs", seq_len(ncol(bs_mat)))
+    out <- bind_cols(out, as.data.frame(bs_mat))
+  }
+
+  ## Pairwise interactions
+  if (interact) {
+    pairs <- combn(base_cols, 2, simplify = FALSE)
+    for (pr in pairs) {
+      nm <- paste(pr, collapse = "_x_")
+      out[[nm]] <- df[[pr[1]]] * df[[pr[2]]]
+    }
+  }
+
+  ## Normalize
+  if (center_scale) {
+    num_cols <- setdiff(names(out), c("zip", "year", "bw_mean", "pm25"))
+    out[num_cols] <- scale(out[num_cols])
+  }
+  num_cols <- c(num_cols, "year")
+  message("Created ", length(num_cols), " features")
+  
+  x <- model.matrix(~ 0 + ., data = out[num_cols])
+  y <- out$bw_mean
+  cv  <- cv.glmnet(x, y, alpha = alpha_lasso, standardize = FALSE)
+  beta_hat <- coef(cv, s = "lambda.1se")  
+  sel_cols <- rownames(beta_hat)[as.vector(beta_hat) != 0]
+  sel_cols <- setdiff(sel_cols, "(Intercept)")
+  
+  d <- out$pm25
+  cv_d  <- cv.glmnet(x, d, alpha = alpha_lasso, standardize = FALSE)
+  beta_hat <- coef(cv_d, s = "lambda.1se")  
+  sel_cols_d <- rownames(beta_hat)[as.vector(beta_hat) != 0]
+  sel_cols_d <- setdiff(sel_cols_d, "(Intercept)")
+  sel_cols <- intersect(sel_cols, sel_cols_d)
+  
+  message("Selected ", length(sel_cols), " features")
+  list(df = out, covars = sel_cols)
+}
+
+bw_df_expanded <- merged_bw_df_selected %>% 
+  expand_covars(base_cols = covars_selected,         
+                spline_df   = 4,
+                interact    = TRUE)
+```
+
 ```{r}
 make_panel_arrays <- function(df, covar_cols = default_covars, years_allowed = 2018:2024,
                               K_expected = 7L) {
@@ -1810,7 +1901,7 @@ make_panel_arrays <- function(df, covar_cols = default_covars, years_allowed = 2
   K <- length(yrs)
   if (K != K_expected) warning("Found ", K, " distinct years; expected ", K_expected)
 
-  # keep covariates present in data
+  # keep covariates present in data, transform and normalize
   covar_cols <- covar_cols[covar_cols %in% names(df)]
   P_x <- length(covar_cols)
   message("Using ", P_x, " covariates: ", paste(covar_cols, collapse = ", "))
@@ -1935,7 +2026,7 @@ summarize_effect_curves <- function(result, Delta = 1.0,
 
   if (is.null(d_grid)) {
     d_all <- as.numeric(result$pan$d_mat)
-    d_grid <- seq(quantile(d_all, 0.01), quantile(d_all, 0.99), length.out = 300)
+    d_grid <- seq(quantile(d_all, 0.02), quantile(d_all, 0.98), length.out = 300)
   }
 
   # Extract beta_lin and theta draws
@@ -1993,37 +2084,71 @@ plot_effects_vi_gg <- function(sumres, Delta = 1.0,
                      sumres$acd[2], sumres$acd[1], sumres$acd[3])
   ate_txt <- sprintf("ATE(+%.1f) = %.3f [%.3f, %.3f]",
                      Delta, sumres$ate[2], sumres$ate[1], sumres$ate[3])
+  subtxt  <- paste(acd_txt, " | ", ate_txt)
+  
+  ## ── Palette & theme ------------------------------------------------------
+  blue   <- "#003C7D"   # dark for medians
+  fill95 <- alpha(blue, 0.15)
 
-  p1 <- ggplot(sumres$dose_df, aes(d, med)) +
-    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15) +
-    geom_line(size = 1) +
-    geom_hline(yintercept = 0, linetype = 3) +
-    labs(x = units_x, y = expression( f(d) - f(bar(d)) ),
-         title = paste0(title_prefix, ": Causal dose–response"),
-         subtitle = "Centered at sample mean exposure") +
-    theme_minimal(base_size = 12)
+  theme_bw_mod <- theme_bw(base_size = 10, base_family = "serif") +
+    theme(
+      panel.grid.major  = element_line(size = .3, colour = "grey85"),
+      panel.grid.minor  = element_blank(),
+      plot.title        = element_text(size = 11, face = "bold"),
+      plot.subtitle     = element_text(size = 9),
+      axis.title        = element_text(size = 9),
+      axis.text         = element_text(size = 8)
+    )
+  
+  # Plot
+  p_dose <- ggplot(sumres$dose_df, aes(d, med)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi),   fill = fill95) +  # 95 %
+    geom_line(colour = blue, size = .8) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = .4) +
+    geom_rug(data = data.frame(d = as.numeric(sumres$raw_d)),    # raw exposure vector
+             aes(d, y = 0), sides = "b", alpha = .4, length = .03) +
+    labs(x = units_x,
+         y = expression(f(d) - f(bar(d))),
+         title = "Causal dose–response") +
+    theme_bw_mod
+  # p_dose <- ggplot(sumres$dose_df, aes(d, med)) +
+  #   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15) +
+  #   geom_line(size = 1) +
+  #   geom_hline(yintercept = 0, linetype = 3) +
+  #   labs(x = units_x, y = expression( f(d) - f(bar(d)) ),
+  #        title = paste0(title_prefix, ": Causal dose–response"),
+  #        subtitle = "Centered at sample mean exposure") +
+  #   theme_minimal(base_size = 12)
 
-  p2 <- ggplot(sumres$te_df, aes(d, med)) +
-    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15) +
-    geom_line(size = 1) +
+  p_te <- ggplot(sumres$te_df, aes(d, med)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), fill = fill95) +
+    geom_line(size = 1, colour = blue) +
     geom_hline(yintercept = 0, linetype = 3) +
     labs(x = units_x, y = "Marginal effect  dY/dD",
-         title = paste0(title_prefix, ": Marginal effect"),
-         subtitle = paste(acd_txt, " · ", ate_txt)) +
-    theme_minimal(base_size = 12)
-
-  list(p_dose = p1, p_te = p2)
+         title = paste0(title_prefix, ": Marginal effect")) +
+    theme_bw_mod
+  
+  (p_dose | p_te) +
+    plot_annotation(
+      title    = title_prefix,
+      subtitle = subtxt,
+      theme    = theme(
+        plot.title    = element_text(size = 12, face = "bold", family = "serif"),
+        plot.subtitle = element_text(size = 9, family = "serif")
+      )
+    )
+  # list(p_dose = p_dose, p_te = p_te)
 }
 ```
 
 ```{r}
 # Fit with VI
 res_vi <- fit_zip_year_te(
-  merged_bw_df_selected,
-  covar_cols = colnames(merged_bw_df_selected)[c(2,4:5,7,11:35)], 
+  bw_df_expanded$df,  #bw_df_expanded$df,
+  covar_cols = bw_df_expanded$covars,    # bw_df_expanded$covars, 
   M = 3L, L = 6L, degree = 3L
 )
-# saveRDS(res_vi, file = "bw_nonlinear_results.rds")
+# saveRDS(res_vi, file = "bw_nonlinear_data_and_results.rds")
 
 # Summarize on a +1 µg/m³ shift
 sumres <- summarize_effect_curves(res_vi, Delta = 1.0, probs = c(0.025, 0.5, 0.975))
@@ -2031,12 +2156,11 @@ sumres <- summarize_effect_curves(res_vi, Delta = 1.0, probs = c(0.025, 0.5, 0.9
 
 # Plot ribbons
 plots <- plot_effects_vi_gg(sumres, Delta = 1.0)
-plots$p_dose
-plots$p_te
+plots
+# ggsave("bw_nonlinear_effects.pdf", plots, width = 6, height = 5, units = "in", dpi = 300)
 
 # Print numeric summaries
 sumres$acd   # 2.5%, 50%, 97.5% for average causal derivative
 sumres$ate   # 2.5%, 50%, 97.5% for average shift by +1
 ```
-
 
