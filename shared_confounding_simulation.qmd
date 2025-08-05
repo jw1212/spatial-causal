@@ -15,6 +15,8 @@ library(fields)
 library(MASS)
 library(pci2s)
 library(gsynth)
+library(FNN)
+library(nFactors)
 
 library(rstiefel)
 # library(psych)    # ML factor analysis (or: factanal)
@@ -188,7 +190,7 @@ fit_spatial_invariant <- function(model, s, d, y, m, cache = NULL) {
 ```{r}
 set.seed(2025) 
 results_sp_loc <- list()
-n_simulations = 40
+n_simulations = 100
 
 N <- 50
 t <- 100
@@ -237,10 +239,7 @@ for (i in 1:n_simulations) {
 # Combine results into a data frame
 results1_df <- do.call(rbind, results_sp_loc)
 results1_df$error <- (results1_df$estimate - 1) / 1
-results1_df
-```
 
-```{r}
 results1_df <- results1_df %>%
   mutate(model = case_when(
     model == "single_dml" ~ "Single DML",
@@ -255,7 +254,10 @@ results1_df <- results1_df %>%
     TRUE ~ model
   ))
 
+# saveRDS(results1_df, file = "sim_linear_factor_N50T100_sp.rds")
+```
 
+```{r}
 # Relative error
 ## results1_df <- readRDS("data/sim_linear_factor_N50T100_sp.rds")
 p1 <- ggplot(results1_df |> filter(model != "PCI"), aes(x = model, y = error)) +
@@ -288,7 +290,7 @@ rho <- 0.9
 results_st_loc <- list()
 
 set.seed(2025) 
-n_simulations = 1
+n_simulations = 100
 
 N <- 50
 t <- 100
@@ -360,10 +362,6 @@ for (j in 1:n_simulations) {
 # Combine results into a data frame
 results2_df <- do.call(rbind, results_st_loc)
 results2_df$error <- (results2_df$estimate - 1) / 1
-results2_df
-```
-
-```{r}
 results2_df <- results2_df %>%
   mutate(model = case_when(
     model == "single_dml" ~ "Single DML",
@@ -378,6 +376,10 @@ results2_df <- results2_df %>%
     TRUE ~ model
   ))
 
+saveRDS(results2_df, file = "sim_linear_factor_N50T100_st.rds")
+```
+
+```{r}
 # calculate bias for each model
 bias_df <- results2_df %>%
   group_by(model) %>%
@@ -512,7 +514,7 @@ n <- 500 # number of locations
 m <- 3 # numer of latent confounders
 sigmaU <- diag(m) 
 results_sp_time <- list()
-n_simulations <- 40
+n_simulations <- 100
 
 A <- matrix(rnorm(t * m, mean = 0, sd=0.3), nrow = t, ncol = m)
 R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
@@ -552,10 +554,6 @@ for (i in 1:n_simulations) {
 }
 results3_df <- do.call(rbind, results_sp_time)
 results3_df$error <- (results3_df$estimate - 1) / 1 
-results3_df
-```
-
-```{r}
 results3_df <- results3_df %>%
   mutate(model = case_when(
     model == "single_dml" ~ "Single DML",
@@ -570,6 +568,10 @@ results3_df <- results3_df %>%
     TRUE ~ model
   ))
 
+# saveRDS(results3_df, file = "sim_linear_factor_N500T10_sp.rds")
+```
+
+```{r}
 ## results3_df <- readRDS("data/sim_linear_factor_N50T100_st.rds")
 p3 <- ggplot(results3_df |> filter(model != "PCI"), aes(x = model, y = error)) +
   geom_boxplot(fill = "dark gray") +
@@ -597,7 +599,7 @@ m <- 3  # number of latent confounders
 sigmaU <- diag(m)  
 results_st_time <- list()
 rho <- 0.9
-n_simulations <- 40
+n_simulations <- 100
 
 A <- matrix(rnorm(t * m, mean = 0, sd=0.5), nrow = t, ncol = m)
 R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
@@ -662,10 +664,6 @@ for (j in 1:n_simulations) {
 }
 results4_df <- do.call(rbind, results_st_time)
 results4_df$error <- results4_df$estimate - 1
-results4_df
-```
-
-```{r}
 results4_df <- results4_df %>%
   mutate(model = case_when(
     model == "single_dml" ~ "Single DML",
@@ -680,6 +678,10 @@ results4_df <- results4_df %>%
     TRUE ~ model
   ))
 
+# saveRDS(results4_df, file = "sim_linear_factor_N500T10_st.rds")
+```
+
+```{r}
 ## results4_df <- readRDS("data/sim_linear_factor_N500T10_st.rds")
 p4 <- ggplot(results4_df |> filter(model != "PCI"), aes(x = model, y = error)) +
   geom_boxplot(fill = "dark gray") +
@@ -1542,6 +1544,11 @@ p7 <- ggplot(results_long,
 ggsave("sim_interference.png", p7, width = 8, height = 5)
 ```
 
+```{r}
+# saveRDS(results_long, file = "sim_spatial_interference_N50T200.rds")
+# ggsave("sim_spatial_interference_N50T200.pdf", p7, width = 6, height = 5, units = "in", dpi = 300)
+```
+
 ## Violation of normality
 
 ```{r}
@@ -1797,83 +1804,3 @@ p9 <- ggplot(results_exchange_df,
 # ggsave("sim_spatial_vs_time_N500T10.pdf", p9, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
-## Exchange spatial and time invariant confounding
-
-```{r}
-results_exchange <- list()
-
-set.seed(2025) 
-n_simulations = 50
-
-N <- 500
-t <- 10
-m <- 3
-sigmaU <- diag(m) 
-A <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
-R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
-gamma <- 0.3 * (A %*% R) + 0.5 * A
-B_true <- diag(N)
-
-for (j in 1:n_simulations) {
-  print(paste("iteration", j))
-
-  u <- mvtnorm::rmvnorm(t, sigma = sigmaU) 
-  d <- u %*% t(A) + rnorm(t * N, sd = 0.5)
-  y <- d %*% t(B_true) + u %*% t(gamma) + rnorm(t * N, sd = 1)
-
-  dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold=5)
-  
-  # Loop over models
-  for (model in c("stack_dml", "nc_mfactor", "ife")) {
-    estimate <- fit_spatial_invariant(model, s, d, y, m, dml_rf)  # Fit the model
-    results_exchange[[length(results_exchange) + 1]] <- data.frame(
-      simulation = j,
-      model = model,
-      estimate = estimate
-    )
-  }
-  model = "nc_mfactor"
-  estimate <- fit_time_invariant(model, s, t(d), t(y), m, dml_rf)  # Fit the model
-  results_exchange[[length(results_exchange) + 1]] <- data.frame(
-    simulation = j,
-    model = paste('time', model),
-    estimate = estimate
-  )
-}
-
-# Combine results into a data frame
-results_exchange_df <- do.call(rbind, results_exchange)
-results_exchange_df <- results_exchange_df %>%
-  mutate(model = case_when(
-    model == "stack_dml" ~ "NUC",
-    model == "nc_mfactor" ~ "Spatial FC",
-    model == "ife" ~ "IFE",
-    model == "time nc_mfactor" ~ "Time FC",
-    TRUE ~ model
-  ))
-
-# saveRDS(results_exchange_df, file = "sim_linear_factor_spatial_vs_time.rds")
-```
-
-```{r}
-results_exchange_df$model <- factor(results_exchange_df$model, levels = c("NUC", "IFE", "Spatial FC", "Time FC"))
-
-p9 <- ggplot(results_exchange_df,
-       aes(x = model, y = estimate, fill = model)) +
-  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 0.4) +
-  geom_boxplot(outlier.size = 0.7, width = 0.65) +
-  labs(title = "Spatially Invariant vs. Time-Invariant Confounding",
-       x = "Estimator",
-       y = "Estimated Effect",
-       fill = "Estimator") +
-  theme_bw() +
-  theme(
-    strip.background = element_rect(fill = "grey90", color = NA),
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    legend.position = "none",
-    plot.title = element_text(face = "bold")
-  ) +
-  coord_cartesian(ylim = c(0.9, 1.5))
-
-# ggsave("sim_spatial_vs_time_N500T10.pdf", p9, width = 6, height = 5, units = "in", dpi = 300)
-```

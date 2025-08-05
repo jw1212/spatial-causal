@@ -1,0 +1,543 @@
+---
+title: "Nonlinear simulation"
+format: html
+editor: visual
+---
+
+```{r}
+library(cmdstanr)
+library(tidyverse)
+library(mgcv)
+library(splines2)
+
+library(rstiefel)
+# library(psych)    # ML factor analysis (or: factanal)
+library(expm)     # for sqrtm
+library(scales)
+library(sn)
+
+source("utilities.R")
+options(mc.cores=parallel::detectCores())
+```
+
+## First simulation
+
+## Nonlinear effect
+
+```{r}
+# Simulation setting
+set.seed(123)
+n  <- 1000      # sample size
+k  <- 5         # # treatments / outcomes
+m  <- 2         # # latent factors
+p  <- 2         # # observed confounders
+
+# Coefficients
+beta_X  <- matrix(c( 1.0, -1.2,   # for D1
+                     0.8,  0.5,   # for D2
+                    -0.4,  1.0,   
+                     0.6, -0.7,
+                     1.5,  0.9), nrow = k, byrow = TRUE)   # d × p
+
+A_mat      <- matrix(c(1.0,  0.3,
+                       0.4, -0.8,
+                      -0.6,  1.0,
+                      -0.7,  -0.3,
+                       1.0, -0.5), nrow = k, byrow = TRUE) 
+Gamma_mat  <- matrix(c(0.4, -0.7,
+                      -0.3,  0.2,
+                       0.8,  0.2,
+                       0.2,  0.7,
+                       0.5,  0.4), nrow = k, byrow = TRUE) 
+
+# Generate data
+X        <- matrix(rnorm(n * p), n, p)              # (n × 2) observed confounders
+colnames(X) <- c("X1", "X2")
+
+V        <- matrix(rnorm(n * m), n, m)              # (n × 2) latent factors
+sigma_xi_vec  <- runif(k, 0.3, 0.5)  
+sigma_eps_vec <- runif(k, 0.3, 0.5)
+
+xi <- sapply(sigma_xi_vec, function(sd) rnorm(n, sd = sd))
+eps <- sapply(sigma_eps_vec, function(sd) rnorm(n, sd = sd))
+
+fD <- function(x1, x2, beta) {        # non‑linear f_Dj
+  beta[1] * sin(x1) + beta[2] * (x2^2 - 1)   # zero‑mean in x2
+}
+
+D <- matrix(NA, n, k)
+for (j in 1:k) {
+  mu_D      <- fD(X[,1], X[,2], beta_X[j, ])
+  D[, j]    <- mu_D + V %*% A_mat[j, ] + xi[, j]
+}
+colnames(D) <- paste0("D", 1:k)
+
+g_fun_list <- list(
+  function(d, x1, x2) tanh(d) + 0.8 * x1^2 - 0.6 * exp(-x2),
+  function(d, x1, x2) sin(d) + 0.7 * x1 * x2,
+  function(d, x1, x2) - 0.3 * d^2 + 0.5 * x1 + 0.6 * x2^2,
+  function(d, x1, x2) d^3 / (1 + d^2) + 0.3 * x1^2 - 0.4 * x2,
+  function(d, x1, x2) log(abs(d) + 1) + 0.4 * x1 - 0.2 * x2^2
+)
+
+Y <- matrix(NA, n, k)
+for (j in 1:k) {
+  g_j      <- g_fun_list[[j]]
+  mu_Y     <- g_j(D[, j], X[, 1], X[, 2])
+  Y[, j]   <- mu_Y + V %*% tilde_Gamma[j, ] + eps[, j]
+}
+colnames(Y) <- paste0("Y", 1:k)
+
+sim_data <- data.frame(X, D, Y)
+head(sim_data)
+
+# Bias
+Sigma_D  <- A_mat %*% t(A_mat) + diag(sigma_xi_vec^2)
+Sigma_VD <- diag(M) - t(A_mat) %*% solve(Sigma_D) %*% A_mat
+Sigma_VD_invhalf <- expm::sqrtm(solve(Sigma_VD))
+tilde_Gamma <- Gamma_mat %*% Sigma_VD_invhalf  
+C_true <- Gamma_mat %*% Sigma_VD_invhalf %*% t(A_mat) %*%
+          solve(Sigma_D)  
+ind_bias <- diag(diag(k) %*% tilde_Gamma %*% t(A_mat) %*% diag(k) / Sigma_D)
+print(ind_bias)
+```
+
+Use the first estimator to estimate effect and bias matrix. 
+
+```{r}
+set.seed(123)
+
+# -------------------------------------------
+# 0.  Helper: n‑fold cross‑fitting indices
+# K_fold <- 5
+# fold_id <- sample(rep(1:K_fold, length.out = nrow(sim_data)))
+
+# -------------------------------------------
+# 1. Estimate off-diagonal of C
+# for (j in 1:k) {
+#   # storage for residuals
+#   residD <- matrix(NA, nrow(sim_data), k-1)
+#   colnames(residD) <- paste0("D", setdiff(1:k, j))
+#   residY <- numeric(nrow(sim_data))
+# 
+#   for (fold in 1:K_fold) {
+#     train <- fold_id != fold
+#     test  <- fold_id == fold
+# 
+#     # flexible model for each D_{-j} and Y_j (here: thin‑plate splines)
+#     for (i in setdiff(1:k, j)) {
+#       form_k <- as.formula(
+#         paste0("D", i, " ~ ",
+#                "s(X1, k = 10) + s(X2, k = 10) + ",
+#                "s(D", j, ", k = 10)")
+#       )
+#       fDk <- gam(form_k, data = sim_data[train, ])
+#       residD[test, paste0("D", k)] <- sim_data[test, paste0("D", k)] -
+#         predict(fDk, newdata = sim_data[test, ])
+#     }
+#     form_Yj <- as.formula(
+#       paste0("Y", j, " ~ ",
+#              "s(X1, k = 10) + s(X2, k = 10) + ",
+#              "s(D", j, ", k = 10)")
+#     )
+#     fYj <- gam(form_Yj, data = sim_data[train, ])
+#     residY[test] <-
+#       sim_data[test, paste0("Y", j)] -
+#       predict(fYj, newdata = sim_data[test, ])
+#   }
+#   fit_j <- lm(residY ~ residD - 1)
+#   C_hat[j, -j] <- coef(fit_j)
+# }
+
+# for (fold in 1:K_fold) {
+#   train <- fold_id != fold;  test <- !train
+#   
+
+C_hat <- matrix(0, k, k)
+
+for (j in 1:k) {
+  form <- as.formula(
+    paste0("Y",j, " ~ ",
+           "s(D",j,", k = 10) +",          # flexible g_j(·)
+           "s(X1, k = 10) + s(X2, k = 10) + ",
+           paste(paste0("D", setdiff(1:k, j)), collapse = " + "))
+  )
+  fit <- mgcv::gam(form, data = sim_data)
+  
+  # linear coefficients come last in the param vector
+  C_hat[j, -j] <- coef(fit)[paste0("D", setdiff(1:k, j)) ]
+}
+
+off_diag_mask <- row(C_hat) != col(C_hat)
+print(sum(abs((C_hat-C_true)[off_diag_mask])))
+C_off <- C_hat  # store for Procrustes
+
+# -------------------------------------------
+# 2. Factor model on residuals and pinpoint C
+D_tilde <- matrix(NA, nrow(sim_data), k)
+colnames(D_tilde) <- paste0("D", 1:k)
+for (j in 1:k) {
+    fDj <- gam(sim_data[,paste0("D",j)] ~ s(X1)+s(X2),
+               data=sim_data)
+    D_tilde[,j] <- sim_data[,paste0("D",j)] - predict(fDj, sim_data)
+}
+
+Y_tilde <- matrix(NA, nrow(sim_data), k)
+colnames(Y_tilde) <- paste0("Y", 1:k)
+for (j in 1:k) {
+  form_Yj <- as.formula(
+    paste0("Y", j, " ~ ",
+           "s(X1, k = 10) + s(X2, k = 10) + ",
+           "s(D", j, ", k = 10) + ",
+           paste(paste0("D", setdiff(1:k, j)), collapse = " + "))
+    )
+  fYj <- gam(form_Yj, data = sim_data)
+  Y_tilde[,j] <- sim_data[,paste0("Y",j)] - predict(fYj, sim_data)
+}
+fa_res <- factanal(D_tilde, factors = m)
+A_hat <- as.matrix(fa_res$loadings)     # d × M
+sds   <- apply(D_tilde, 2, sd)       # standard deviations of columns
+A_hat <- A_hat * sds                 # scale loadings back to original scale
+psi_raw <- fa_res$uniquenesses         # vector of length d
+Psi_cov <- diag(psi_raw * sds^2)        # scale to original variance scale
+Sigma_D_hat <- A_hat %*% t(A_hat) + Psi_cov  
+
+fa_resY <- factanal(Y_tilde, m) # fa(D_tilde, nfactors = M, rotate = "none", scores = "regression")
+Gamma_hat <- as.matrix(fa_resY$loadings)   # k by m
+Gamma_hat <- Gamma_hat * sqrt(diag(cov(Y_tilde)))         
+
+Sigma_VD_hat <- diag(M) - t(A_hat) %*% solve(cov(D_tilde)) %*% A_hat
+Sigma_VD_hat <- (Sigma_VD_hat + t(Sigma_VD_hat))/2   # numerical stabilisation
+Sigma_VD_hat <- Sigma_VD_hat + 1e-8 * diag(M)
+
+inv_sqrt_Sigma_VD <- expm::sqrtm(solve(Sigma_VD_hat))
+R_hat  <- inv_sqrt_Sigma_VD %*% t(A_hat) %*% solve(cov(D_tilde))
+
+# Optimize on the Stiefel manifold
+# -------- objective:  ‖  W*(Γ Θ R − C_off) ‖_F²  --------------------
+Wmat <- matrix(1, k, k); diag(Wmat) <- 0
+obj_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat          # k × k
+  diff  <- (Mtmp - C_off) * Wmat                  # mask diag
+  sum(diff * diff)                                # Frobenius²
+}
+
+# gradient 
+grad_fn <- function(Theta) {
+  Mtmp  <- Gamma_hat %*% Theta %*% R_hat
+  diff  <- (Mtmp - C_off) * Wmat                  # k × k
+  2 * ( t(Gamma_hat) %*% diff %*% t(R_hat) )      # M × M
+}
+
+set.seed(111)
+best_obj <- Inf
+Theta_hat <- NULL
+n_starts <- 10  # try 5-20 for stability
+for (i in 1:n_starts) {
+  Theta_init <- rustiefel(M, M) 
+  current_result <- optStiefel(F = obj_fn,
+                          dF = grad_fn,
+                          Vinit = Theta_init, 
+                          # method="curvilinear",
+                          maxIters = 100,
+                          maxLineSearchIters = 100,
+                          tol = 1e-10,
+                          verbose = TRUE) # M × M orthogonal
+  current_obj <- obj_fn(current_result)
+  if (current_obj < best_obj) {
+    best_obj <- current_obj
+    Theta_hat <- current_result
+  }
+}
+
+# --------- recovered bias matrix ------------------------------------
+C_hat <- Gamma_hat %*% Theta_hat %*% R_hat
+C_hat1 <- C_off
+diag(C_hat1) <- diag(C_hat)
+print(round(C_true,3))
+print(round(C_hat1, 3))
+print(round(C_hat, 3))
+print(round(max(abs(C_hat - C_true)),3))
+
+# -------------------------------------------
+# 3.  Debias Y and estimate g_j(d)
+Y_db <- as.matrix(sim_data[, paste0("Y", 1:k)]) -
+        D_tilde %*% t(C_hat1)
+# Y_db <- as.matrix(sim_data[, paste0("Y", 1:k)]) -
+#         D_tilde %*% diag(ind_bias)
+
+# Dose–response at mean X  (we ignore X to mimic "average over X")
+x1_bar <- mean(sim_data$X1)
+x2_bar <- mean(sim_data$X2)
+
+g_fit  <- list()
+d_grid <- seq(-5, 5, length = 300)
+g_hat  <- matrix(NA, length(d_grid), k)
+
+for (j in 1:k) {
+  df <- data.frame(y = Y_db[, j],
+                   d = sim_data[, paste0("D", j)],
+                   x1 = sim_data$X1,
+                   x2 = sim_data$X2)
+  g_fit[[j]] <- gam(y ~ s(d, k = 20) + s(x1, k = 20) + s(x2, k = 20), data = df)
+  g_hat[, j] <- predict(g_fit[[j]], newdata = data.frame(
+    d = d_grid,
+    x1 = x1_bar,   # Fix x1, x2 at mean so only s(d) varies
+    x2 = x2_bar
+  ))   #,  type = "terms")[, "s(d)"]
+}
+plot_df <- data.frame(
+  d = rep(d_grid, k),
+  g = as.vector(g_hat),
+  outcome = factor(rep(1:k, each = length(d_grid)), labels = paste("Outcome", 1:k))
+)
+
+
+# -------------------------------------------
+# 4.  Plot of the five causal curves
+
+# Create true g_j curves at mean(X1, X2)
+g_true <- matrix(NA, length(d_grid), k)
+for (j in 1:d) {
+  g_j <- g_fun_list[[j]]
+  g_true[, j] <- g_j(d_grid, x1_bar, x2_bar)
+}
+
+# Prepare data frame for true g_j
+true_df <- data.frame(
+  d = rep(d_grid, k),
+  g = as.vector(g_true),
+  outcome = factor(rep(1:k, each = length(d_grid)), labels = paste("Outcome", 1:k))
+)
+
+# Create naive estimate 
+g_fit_naive  <- list()
+g_hat_naive  <- matrix(NA, length(d_grid), k)
+
+for (j in 1:k) {
+  df_naive <- data.frame(y = sim_data[, paste0("Y", j)],
+                         d = sim_data[, paste0("D", j)],
+                         x1 = sim_data$X1,
+                         x2 = sim_data$X2)
+  g_fit_naive[[j]] <- gam(y ~ s(d, k = 20) + s(x1, k = 20) + s(x2, k = 20), data = df_naive)
+  g_hat_naive[,j] <- predict(g_fit_naive[[j]], newdata = data.frame(
+    d = d_grid,
+    x1 = x1_bar,   # Fix x1, x2 at mean so only s(d) varies
+    x2 = x2_bar
+  ))         # ,  type = "terms")[, "s(d)"]
+}
+plot_df_naive <- data.frame(
+  d = rep(d_grid, k),
+  g = as.vector(g_hat_naive),
+  outcome = factor(rep(1:k, each = length(d_grid)), labels = paste("Outcome", 1:k))
+)
+
+# plot
+
+p6 <- ggplot() +
+  geom_line(data = plot_df, aes(x = d, y = g, color = "Debiased"), size = 1) +
+  geom_line(data = plot_df_naive, aes(x = d, y = g, color = "Naive"), linetype = "dotdash", size = 1) +
+  geom_line(data = true_df, aes(x = d, y = g, color = "True"), linetype = "dashed", size = 1) +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 3) +
+  scale_y_continuous(breaks = pretty_breaks(n = 5)) +
+  scale_color_manual(
+    values = c(
+      "Debiased" = "#0072B2",  # brighter blue
+      "Naive" = "#009E73",     # brighter green
+      "True" = "#E41A1C"       # brighter red-orange
+    ),
+    labels = c("Debiased Estimate", "Naive Estimate", "True Effect")
+  ) +
+  labs(
+    title = "Estimated Dose–Response Functions",
+    x = expression("Treatment Dose"),
+    y = expression("Causal Effect"),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.major = element_line(size = 0.2, color = "grey80"),
+    panel.grid.minor = element_blank(),
+    text = element_text(family = "serif"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+p6
+# ggsave("sim_nonlinear_Factor_5outcomes.pdf", p6, width = 6, height = 5, units = "in", dpi = 300)
+```
+
+## Second simulation
+
+Second example of nonlinear effect: same effect across unit and time.
+
+```{r}
+# ---------- True nonlinear causal effect (not splines) ----------
+# Work on z-scale (global standardization). Smooth, monotone-ish but flexible.
+f_true <- function(z) {
+  0.8 * z + 0.9 * tanh(0.7 * z) + 0.25 * z^3 / 3
+}
+# Marginal TE on z-scale: derivative of f_true
+fprime_true <- function(z) {
+  0.8 + 0.9 * 0.7 * (1 / cosh(0.7 * z))^2 + 0.25 * z^2
+}
+# Convert marginal TE to original d-scale: divide by sd(d)
+TE_true_on_d <- function(d, d_mean, d_sd) {
+  z <- (d - d_mean) / d_sd
+  fprime_true(z) / d_sd
+}
+
+# ---------- Simulate data ----------
+simulate_dataset <- function(K = 5, N = 1000, M = 2, P_x = 3,
+                             sigma_d = 0.6, sigma_y = 0.7) {
+  alpha_d <- rnorm(K, 0, 0.5)
+  alpha_y <- rnorm(K, 0, 0.5)
+
+  B_Xd <- c(0.6, -0.4, 0.2)[seq_len(P_x)]
+  if (length(B_Xd) < P_x) B_Xd <- c(B_Xd, rnorm(P_x - length(B_Xd), 0, 0.3))
+  B_Xy <- c(0.3, 0.1, -0.2)[seq_len(P_x)]
+  if (length(B_Xy) < P_x) B_Xy <- c(B_Xy, rnorm(P_x - length(B_Xy), 0, 0.3))
+
+  A     <- matrix(rnorm(K * M, 0, 0.7), K, M)
+  gamma <- matrix(rnorm(K * M, 0, 0.7), K, M)
+
+  # Covariates: N x K x P_x
+  X_array <- array(rnorm(N * K * P_x), dim = c(N, K, P_x))
+  # Latent confounders shared by D and Y
+  U_mat <- matrix(rnorm(N * M), N, M)
+
+  d_mat <- matrix(NA_real_, N, K)
+  y_mat <- matrix(NA_real_, N, K)
+
+  # Generate D linearly from U and X, add noise
+  for (n in 1:N) {
+    Xnk <- matrix(X_array[n, , ], nrow = K, ncol = P_x)
+    mean_d <- alpha_d + as.vector(Xnk %*% B_Xd) + A %*% U_mat[n, ]
+    d_mat[n, ] <- mean_d + rnorm(K, 0, sigma_d)
+  }
+
+  # Global standardization for building f_true(z)
+  d_mean <- mean(d_mat); d_sd <- sd(d_mat)
+  z_mat  <- (d_mat - d_mean) / d_sd
+
+  # Generate Y using the true nonlinear causal f_true(z) + gamma U + X effects
+  for (n in 1:N) {
+    Xnk <- matrix(X_array[n, , ], nrow = K, ncol = P_x)
+    x_eff <- as.vector(Xnk %*% B_Xy)
+    f_vec <- f_true(z_mat[n, ])        # elementwise on z
+    mean_y <- alpha_y + x_eff + as.vector(gamma %*% U_mat[n, ]) + f_vec
+    y_mat[n, ] <- mean_y + rnorm(K, 0, sigma_y)
+  }
+
+  list(
+    K = K, N = N, M = M, P_x = P_x,
+    alpha_d = alpha_d, alpha_y = alpha_y,
+    B_Xd = B_Xd, B_Xy = B_Xy,
+    A = A, gamma = gamma,
+    sigma_d = sigma_d, sigma_y = sigma_y,
+    X_array = X_array,
+    U_mat = U_mat,
+    d_mat = d_mat, y_mat = y_mat,
+    d_mean = d_mean, d_sd = d_sd
+  )
+}
+
+
+# ---------- Prepare Stan data ----------
+prepare_stan_data <- function(sim, L = 8, degree = 3) {
+  K <- sim$K; N <- sim$N; P_x <- sim$P_x
+
+  bases <- build_bases(sim$d_mat, L = L, degree = degree)
+
+  d_arr <- lapply(1:N, function(t) as.vector(bases$z_mat[t, ]))   # standardized d
+  y_arr <- lapply(1:N, function(t) as.vector(sim$y_mat[t, ]))
+  X_list <- lapply(1:N, function(t) matrix(sim$X_array[t, , ], nrow = K, ncol = P_x))
+
+  list(
+    data_list = list(
+      K = K, N = N, M = sim$M,
+      d = d_arr, y = y_arr,
+      P_x = P_x,
+      X = X_list,
+      L = L,
+      B = lapply(1:K, function(k) bases$B_list[[k]])
+    ),
+    aux = list(
+      d_mean = bases$d_mean, d_sd = bases$d_sd,
+      knot_info = bases$knot_info,
+      col_means = bases$col_means
+    )
+  )
+}
+
+# ---------- Fit with cmdstanr ----------
+fit_homog_model <- function(data_list, stan_path) {
+  sm <- cmdstanr::cmdstan_model(stan_path)
+  sm$optimize(data = data_list, init = 2, iter = 2000, show_messages = FALSE)
+}
+
+# Dose–response curve (causal component). Optionally center at a reference d0.
+dose_response_curve <- function(d_grid, beta_lin, theta, aux, ref = NULL) {
+  f_vals <- f_causal(d_grid, beta_lin, theta, aux)
+  if (!is.null(ref)) {
+    f_ref <- f_causal(ref, beta_lin, theta, aux)
+    f_vals <- f_vals - f_ref
+  }
+  f_vals
+}
+```
+
+```{r}
+K = 5; N = 1000; M = 2; P_x = 3; L = 8; degree = 3
+sim <- simulate_dataset(K = K, N = N, M = M, P_x = P_x)
+prep <- prepare_stan_data(sim, L = L, degree = degree)
+  
+fit <- fit_homog_model(prep$data_list, "stan/nonlinear_factor.stan")
+mle <- fit$mle()
+beta_lin <- as.numeric(mle["beta_lin"])
+theta    <- as.numeric(mle[grep("^theta\\[", names(mle))])
+
+# TE curves
+d_grid <- seq(quantile(sim$d_mat,0.01), quantile(sim$d_mat,0.99), length.out = 400)
+te_true <- TE_true_on_d(d_grid, sim$d_mean, sim$d_sd)
+te_est  <- te_curve_from_fit(d_grid, mle, prep$aux)
+
+plot(d_grid, te_true, type = "l", lwd = 2,
+     xlab = "d (original units)", ylab = "Marginal TE(d)",
+     main = "True vs Estimated Marginal Treatment Effect")
+lines(d_grid, te_est, lwd = 2, lty = 2)
+abline(h = 0, lty = 3)
+legend("topright", c("True", "Estimated (MLE)"),
+       lwd = 2, lty = c(1, 2), bty = "n")
+
+cat(sprintf("\nMean abs error TE(d): %.4f\n", mean(abs(te_true - te_est))))
+invisible(list(sim = sim, fit = fit, d_grid = d_grid, te_true = te_true, te_est = te_est))
+
+
+# 1) ACD
+acd <- average_causal_derivative(sim$d_mat, beta_lin, theta, prep$aux)
+cat(sprintf("Average causal derivative (ACD): %.4f\n", acd))
+
+# 2) ATE for +Delta shift
+Delta <- 1.0
+ate_Delta <- average_shift_effect(sim$d_mat, Delta, beta_lin, theta, prep$aux)
+cat(sprintf("Average finite change for +%.3f shift in D: %.4f\n", Delta, ate_Delta))
+
+# 3) Dose–response curve
+f_hat <- dose_response_curve(d_grid, beta_lin, theta, prep$aux, ref = prep$aux$d_mean)
+
+plot(d_grid, f_hat, type = "l", lwd = 2,
+     xlab = "D (original units)",
+     ylab = "Causal dose–response  f(d) − f(d_ref)",
+     main = "Estimated causal dose–response (homogeneous)")
+abline(h = 0, lty = 3)
+f_true_vals <- f_true( (d_grid - sim$d_mean)/sim$d_sd )
+  # shift to same reference
+  f_true_vals <- f_true_vals - f_true(0)  # because ref at d_mean => z = 0
+  lines(d_grid, f_true_vals, lwd = 2, lty = 2)
+  legend("topleft", c("Estimated", "True"), lwd = 2, lty = c(1,2), bty = "n")
+```
+
+
