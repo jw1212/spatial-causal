@@ -766,18 +766,21 @@ print(vif(lm(bw_mean ~ ., data = merged_bw_df_selected %>% dplyr::select(-zip, -
 
 ```{r}
 # saveRDS(merged_bw_df_selected, file = "birthweight_data_preprocess.rds")
-merged_bw_df_selected <- readRDS("birthweight_data_preprocess.rds")
+merged_bw_df_selected <- readRDS("data/birthweight_data_preprocess.rds")
 ```
 
 ## Partially linear model
 
 ```{r}
+
+
 raw_names <- colnames(merged_bw_df_selected)[11:35]
 colnames(merged_bw_df_selected)[11:35] <- paste0("x", 1:25)
-formula <- as.formula(paste("bw_mean ~ pm25 + median_income + s(lat, long, k=200) + factor(year) + ",
+formula <- as.formula(paste("bw_mean ~ pm25 + s(median_income) + s(lat, long, k=200) + factor(year) + ",
                             paste(colnames(merged_bw_df_selected)[11:35]  , collapse = " + ")))
 
 fit1 <- mgcv::gam(formula, data = merged_bw_df_selected) 
+plot(fit1,select=1, rug=TRUE)
 get_gam_ci(fit1, "pm25")
 ```
 
@@ -2045,3 +2048,28 @@ sumres$ate   # 2.5%, 50%, 97.5% for average shift by +1
 ```
 
 
+```{r}
+
+x_train <- merged_bw_df_selected %>%
+  dplyr::select(year, pm25, lat, long, median_income, `15 years and under`:`No Prenatal Care`) %>%
+  mutate(year = as.inteZger(year)) |> as.matrix()
+
+x_test <- rbind(x_train, x_train, x_train, x_train,
+                x_train, x_train, x_train, x_train)
+
+x_test[, "pm25"] <- sample(merged_bw_df_selected$pm25, 8*nrow(x_train), replace = TRUE)
+
+prop_score_bart <- BART::wbart(x_train[, -2], x_train[, "pm25"])
+prop_score <- colMeans(prop_score_bart$yhat.train)
+prop_score_test <- colMeans(predict(prop_score_bart, newdata = x_test[, -2]))
+
+y_train <- merged_bw_df_selected$bw_mean |> as.numeric()
+bart_res <- BART::wbart(cbind(x_train, prop_score), y_train, x.test= cbind(x_test, prop_score_test))
+
+preds <- tibble(pm25 = x_test[, "pm25"], yhat = colMeans(bart_res$yhat.test))
+
+a <- preds |> ggplot(aes(x=pm25, y=yhat)) + 
+#  geom_point() +
+  geom_smooth()
+ggsave("birthweight_bart.png", a, width = 6, height = 5, units = "in", dpi = 300)
+```
