@@ -20,6 +20,8 @@ library(sf)
 library(raster)
 library(rasterVis)
 library(exactextractr)
+library(ranger)
+library(patchwork)
 
 source("utilities.R")
 ```
@@ -2088,30 +2090,22 @@ plot_effects_vi_gg <- function(sumres, Delta = 1.0,
                                title_prefix = "PM2.5 on Birthweight",
                                units_x = "PM2.5 (µg/m³)") {
 
-  acd_txt <- sprintf("ACD = %.3f [%.3f, %.3f]",
+  acd_txt <- sprintf("ACD = %.1f [%.1f, %.1f]",
                      sumres$acd[2], sumres$acd[1], sumres$acd[3])
-  ate_txt <- sprintf("ATE(+%.1f) = %.3f [%.3f, %.3f]",
-                     Delta, sumres$ate[2], sumres$ate[1], sumres$ate[3])
-  subtxt  <- paste(acd_txt, " | ", ate_txt)
+  ate_txt <- sprintf("ATE(+%.1f) = %.1f [%.1f, %.1f]",
+                     10*Delta, 10*sumres$ate[2], 10*sumres$ate[1], 10*sumres$ate[3])
+  subtxt  <- paste(ate_txt, " | ", acd_txt)
   
   ## ── Palette & theme ------------------------------------------------------
-  blue   <- "#003C7D"   # dark for medians
-  fill95 <- alpha(blue, 0.15)
+  median_color   <- "black"   # dark for medians
+  fill95 <- alpha(median_color, 0.15)
 
-  theme_bw_mod <- theme_bw(base_size = 10, base_family = "serif") +
-    theme(
-      panel.grid.major  = element_line(size = .3, colour = "grey85"),
-      panel.grid.minor  = element_blank(),
-      plot.title        = element_text(size = 11, face = "bold"),
-      plot.subtitle     = element_text(size = 9),
-      axis.title        = element_text(size = 9),
-      axis.text         = element_text(size = 8)
-    )
+  theme_bw_mod <- theme_bw(base_size = 16)
   
   # Plot
   p_dose <- ggplot(sumres$dose_df, aes(d, med)) +
     geom_ribbon(aes(ymin = lo, ymax = hi),   fill = fill95) +  # 95 %
-    geom_line(colour = blue, size = .8) +
+    geom_line(colour = median_color, size = .8) +
     geom_hline(yintercept = 0, linetype = "dashed", linewidth = .4) +
     geom_rug(data = data.frame(d = as.numeric(sumres$raw_d)),    # raw exposure vector
              aes(d, y = 0), sides = "b", alpha = .4, length = .03) +
@@ -2130,21 +2124,22 @@ plot_effects_vi_gg <- function(sumres, Delta = 1.0,
 
   p_te <- ggplot(sumres$te_df, aes(d, med)) +
     geom_ribbon(aes(ymin = lo, ymax = hi), fill = fill95) +
-    geom_line(size = 1, colour = blue) +
+    geom_line(size = 1, colour = median_color) +
     geom_hline(yintercept = 0, linetype = 3) +
-    labs(x = units_x, y = "Marginal effect  dY/dD",
-         title = paste0(title_prefix, ": Marginal effect")) +
-    theme_bw_mod
+    labs(x = units_x, y = "dY/dD",
+         title = paste0("Marginal effect")) +
+    theme_bw_mod +
+    annotate("text", x = Inf, y = Inf, label = acd_txt, 
+             hjust = 1.05, vjust = 1.5, size = 5.5, 
+             family = "serif")
   
-  (p_dose | p_te) +
-    plot_annotation(
-      title    = title_prefix,
-      subtitle = subtxt,
-      theme    = theme(
-        plot.title    = element_text(size = 12, face = "bold", family = "serif"),
-        plot.subtitle = element_text(size = 9, family = "serif")
-      )
-    )
+  # Add ATE annotation to dose plot
+  p_dose <- p_dose +
+    annotate("text", x = Inf, y = Inf, label = ate_txt, 
+             hjust = 1.05, vjust = 1.5, size = 5.5, 
+             family = "serif")
+  
+  (p_dose | p_te)
   # list(p_dose = p_dose, p_te = p_te)
 }
 ```
@@ -2160,12 +2155,14 @@ res_vi <- fit_zip_year_te(
 
 # Summarize on a +1 µg/m³ shift
 sumres <- summarize_effect_curves(res_vi, Delta = 1.0, probs = c(0.025, 0.5, 0.975))
-# saveRDS(sumres, file = "bw_nonlinear_estimated_effects.rds")
+# saveRDS(sumres, file = "data/bw_nonlinear_estimated_effects.rds")
+sumres <- readRDS("data/bw_nonlinear_estimated_effects.rds")  # load precomputed results
 
 # Plot ribbons
 plots <- plot_effects_vi_gg(sumres, Delta = 1.0)
 plots
-# ggsave("bw_nonlinear_effects.pdf", plots, width = 6, height = 5, units = "in", dpi = 300)
+
+ggsave(file="bw_nonlinear_effects.png", width = 9, height = 6, units = "in", dpi = 300)
 
 # Print numeric summaries
 sumres$acd   # 2.5%, 50%, 97.5% for average causal derivative
@@ -2197,3 +2194,4 @@ a <- preds |> ggplot(aes(x=pm25, y=yhat)) +
   geom_smooth()
 ggsave("birthweight_bart.png", a, width = 6, height = 5, units = "in", dpi = 300)
 ```
+
