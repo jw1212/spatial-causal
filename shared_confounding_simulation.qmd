@@ -1804,3 +1804,81 @@ p9 <- ggplot(results_exchange_df,
 # ggsave("sim_spatial_vs_time_N500T10.pdf", p9, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
+## IFE vs FC under varying individual confounding
+
+```{r}
+draw_A_Gamma <- function(N, m, rho, sd_A = 1, sd_Gam = 1) {
+  Sigma2 <- matrix(c(1, rho, rho, 1), 2, 2)
+  pairs <- rmvnorm(N*m, mean = c(0, 0), sigma = Sigma2)
+  A     <- matrix(sd_A  * pairs[, 1], nrow = N, ncol = m)
+  Gamma <- matrix(sd_Gam* pairs[, 2], nrow = N, ncol = m)
+  list(A = A, Gamma = Gamma)
+}
+```
+
+```{r}
+set.seed(2025)
+results_individual <- list()
+n_simulations = 20
+
+N <- 50
+T_grid  <- c(10, 50, 100)
+rho_grid <- c(0.0, 0.5, 0.9)
+m <- 3
+sigmaU <- diag(m)  
+
+
+# A <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
+# R <- qr.Q(qr(matrix(rnorm(m*m), m)))
+# gamma <- 0.3 * (A %*% R) + 0.5 * A
+beta_true <- 1
+
+for (t in T_grid) {
+  print(paste("T=", t))
+  for (rho in rho_grid) {
+    LG <- draw_A_Gamma(N, m, rho, sd_A = 0.7, sd_Gam = 0.3)
+    A <- LG$A; gamma <- LG$Gamma
+    # print(cor(as.numeric(A), as.numeric(gamma)))
+
+    for (i in 1:n_simulations) {
+      # Generate data
+      u <- mvtnorm::rmvnorm(t, sigma = sigmaU) # t * m
+      d <- u %*% t(A) + rnorm(t * N, sd = 0.5)  # t by N
+      y <- beta_true * d + u %*% t(gamma) + rnorm(t * N, sd = 0.5) 
+      
+      dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold=5)
+    
+      # Loop over models
+      for (model in c("stack_dml", "nc_mfactor", "ife")) {
+        estimate <- fit_spatial_invariant(model, s=NULL, d, y, m, dml_rf)  # Fit the model 
+        results_individual[[length(results_individual) + 1]] <- data.frame(
+          simulation = i,
+          t = t,
+          rho = rho,
+          model = model,
+          estimate = estimate
+        )
+      }
+    }
+  }
+}
+
+
+# Combine results into a data frame
+results_individual_df <- do.call(rbind, results_individual) %>%
+  mutate(model = case_when(
+    model == "stack_dml" ~ "NUC",
+    model == "nc_mfactor" ~ "FC",
+    model == "ife" ~ "IFE",
+    TRUE ~ model
+  ),
+  model = factor(model, levels = c("NUC", "IFE", "FC")),
+  rho_f = factor(rho, levels = rho_grid, labels = paste0("rho = ", rho_grid)),
+  T_f   = factor(t, levels = T_grid, labels = paste0("T = ", T_grid)))
+results_individual_df
+
+# results_individual_df <- readRDS("sim_IFE_vs_FC_setting_1.rds")
+# saveRDS(results_individual_df, file = "sim_IFE_vs_FC_setting_1.rds")
+```
+
+
